@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — Snickerdoodle Checker</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍪</text></svg>">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>tailwind.config={darkMode:'class',theme:{extend:{colors:{dark:{50:'#0a0f1a',100:'#0f1729',200:'#141f38',300:'#1a2847'},accent:{DEFAULT:'#3b82f6',hover:'#2563eb'}}}}}</script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body class="bg-dark-50 min-h-screen flex items-center justify-center p-5" x-data="loginApp()">
+    <div class="bg-dark-100 border border-dark-300 rounded-2xl p-8 w-full max-w-sm shadow-2xl text-center">
+        <div class="text-5xl mb-4">🍪</div>
+        <h1 class="text-xl font-bold text-white mb-1">Snickerdoodle Checker</h1>
+        <p class="text-xs text-gray-500 font-bold uppercase tracking-widest mb-8">Enter Password</p>
+
+        <form @submit.prevent="login()">
+            <input type="password" x-model="password" placeholder="Password"
+                   class="w-full bg-dark-200 border border-dark-300 rounded-xl px-4 py-3 text-center text-lg font-bold
+                          text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 focus:ring-1
+                          focus:ring-blue-500/30 transition-all mb-4 tracking-widest"
+                   autofocus autocomplete="current-password">
+
+            <button type="submit" :disabled="loading"
+                    class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-xl
+                           transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                <span x-show="!loading">Unlock</span>
+                <span x-show="loading">Authenticating...</span>
+            </button>
+        </form>
+
+        <p x-show="error" x-text="error" class="text-red-400 text-sm font-semibold mt-4"></p>
+        <p class="text-gray-600 text-xs mt-6">Snickerdoodle Checker v2.0</p>
+    </div>
+
+    <script>
+    function loginApp() {
+        return {
+            password: '',
+            error: '',
+            loading: false,
+            async login() {
+                this.error = '';
+                this.loading = true;
+                try {
+                    const resp = await fetch('/api/auth/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'same-origin',
+                        body: JSON.stringify({ password: this.password }),
+                    });
+                    const data = await resp.json();
+                    if (data.success) {
+                        window.location.href = '/';
+                    } else {
+                        this.error = data.message || 'Invalid password';
+                        this.password = '';
+                    }
+                } catch (e) {
+                    this.error = 'Connection error';
+                } finally {
+                    this.loading = false;
+                }
+            }
+        };
+    }
+    </script>
+</body>
+</html>

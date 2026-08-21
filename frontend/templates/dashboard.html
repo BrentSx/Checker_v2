@@ -1,0 +1,246 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Snickerdoodle Checker{% endblock %}
+
+{% block content %}
+<div x-data="dashboardApp()" x-init="init()">
+    <!-- Page Header -->
+    <div class="flex items-center justify-between mb-6">
+        <h2 class="text-2xl font-bold text-white">Dashboard</h2>
+        <div class="flex items-center gap-2 text-sm">
+            <span class="status-dot" :class="wsConnected ? 'green' : 'red'"></span>
+            <span class="text-gray-500" x-text="wsConnected ? 'Live' : 'Disconnected'"></span>
+        </div>
+    </div>
+
+    <!-- Status Cards Grid -->
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-6">
+        <!-- Telegram -->
+        <div class="card">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-xs font-semibold text-gray-500 uppercase">Telegram</span>
+                <span class="status-dot" :class="statusDotClass(status.telegram?.state)"></span>
+            </div>
+            <p class="text-sm font-bold text-white capitalize" x-text="status.telegram?.state || 'idle'"></p>
+        </div>
+        <!-- Queue -->
+        <div class="card">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-xs font-semibold text-gray-500 uppercase">Queue</span>
+                <span class="status-dot" :class="status.queue?.running ? 'green' : 'red'"></span>
+            </div>
+            <p class="stat-value text-xl" x-text="status.queue?.queued || 0"></p>
+            <p class="text-xs text-gray-500">files queued</p>
+        </div>
+        <!-- Checker -->
+        <div class="card">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-xs font-semibold text-gray-500 uppercase">Checker</span>
+                <span class="status-dot" :class="status.checker?.running ? 'blue pulse-active' : 'green'"></span>
+            </div>
+            <p class="text-sm font-bold text-white" x-text="status.checker?.running ? 'Running' : 'Idle'"></p>
+        </div>
+        <!-- Discord -->
+        <div class="card">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-xs font-semibold text-gray-500 uppercase">Discord</span>
+                <span class="status-dot" :class="status.discord?.configured ? (status.discord?.last_error ? 'red' : 'green') : 'gray'"></span>
+            </div>
+            <p class="text-sm font-bold text-white" x-text="status.discord?.configured ? (status.discord?.last_error ? 'Error' : 'Connected') : 'Not configured'"></p>
+        </div>
+        <!-- Cloudflare -->
+        <div class="card">
+            <div class="flex items-center justify-between mb-2">
+                <span class="text-xs font-semibold text-gray-500 uppercase">Cloudflare</span>
+                <span class="status-dot" :class="statusDotClass(status.cloudflare?.state)"></span>
+            </div>
+            <p class="text-sm font-bold text-white capitalize" x-text="status.cloudflare?.state || 'idle'"></p>
+        </div>
+    </div>
+
+    <!-- Current Job -->
+    <div class="card mb-6" x-show="status.current_job">
+        <div class="card-header">
+            <h3 class="card-title">Current Job</h3>
+            <span class="badge badge-blue pulse-active" x-text="status.current_job?.status?.toUpperCase().replace('_', ' ')"></span>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div>
+                <p class="text-xs text-gray-500 mb-1">File</p>
+                <p class="text-sm font-bold text-white truncate" x-text="status.current_job?.filename || '—'"></p>
+            </div>
+            <div>
+                <p class="text-xs text-gray-500 mb-1">Job ID</p>
+                <p class="text-sm font-mono text-gray-300" x-text="(status.current_job?.id || '—').substring(0, 8)"></p>
+            </div>
+            <div>
+                <p class="text-xs text-gray-500 mb-1">Progress</p>
+                <p class="text-sm font-bold text-white" x-text="Math.round(status.current_job?.progress || 0) + '%'"></p>
+            </div>
+            <div>
+                <p class="text-xs text-gray-500 mb-1">Files Checked</p>
+                <p class="text-sm font-bold text-white">
+                    <span x-text="formatNumber(status.current_job?.files_checked || 0)"></span>
+                    <span class="text-gray-500" x-show="status.current_job?.files_total"> / <span x-text="formatNumber(status.current_job?.files_total)"></span></span>
+                </p>
+            </div>
+        </div>
+        <div class="mt-4">
+            <div class="progress-bar">
+                <div class="progress-fill" :style="`width: ${status.current_job?.progress || 0}%`"></div>
+            </div>
+        </div>
+        <div class="grid grid-cols-3 gap-4 mt-4" x-show="status.current_job?.status === 'downloading'">
+            <div>
+                <p class="text-xs text-gray-500">Downloaded</p>
+                <p class="text-sm font-bold text-white" x-text="formatBytes(status.current_job?.downloaded_bytes) + ' / ' + formatBytes(status.current_job?.file_size)"></p>
+            </div>
+            <div>
+                <p class="text-xs text-gray-500">Speed</p>
+                <p class="text-sm font-bold text-white" x-text="formatBytes(status.current_job?.download_speed) + '/s'"></p>
+            </div>
+            <div>
+                <p class="text-xs text-gray-500">Started</p>
+                <p class="text-sm font-bold text-white" x-text="timeAgo(status.current_job?.started_at)"></p>
+            </div>
+        </div>
+    </div>
+
+    <!-- No Job Running -->
+    <div class="card mb-6 text-center py-8" x-show="!status.current_job">
+        <p class="text-gray-500 text-lg">No active job</p>
+        <p class="text-gray-600 text-sm mt-1">Waiting for files from Telegram...</p>
+    </div>
+
+    <!-- System Resources -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <div class="card">
+            <p class="text-xs text-gray-500 mb-2">CPU</p>
+            <p class="stat-value text-xl" x-text="(status.system?.cpu_percent || 0).toFixed(1) + '%'"></p>
+            <div class="progress-bar mt-2">
+                <div class="progress-fill" :style="`width: ${status.system?.cpu_percent || 0}%`"
+                     :class="status.system?.cpu_percent > 90 ? 'bg-red-500' : status.system?.cpu_percent > 70 ? 'bg-yellow-500' : ''"></div>
+            </div>
+        </div>
+        <div class="card">
+            <p class="text-xs text-gray-500 mb-2">Memory</p>
+            <p class="stat-value text-xl" x-text="(status.system?.memory_percent || 0).toFixed(1) + '%'"></p>
+            <p class="text-xs text-gray-500 mt-1" x-text="formatBytes(status.system?.memory_used) + ' / ' + formatBytes(status.system?.memory_total)"></p>
+        </div>
+        <div class="card">
+            <p class="text-xs text-gray-500 mb-2">Disk</p>
+            <p class="stat-value text-xl" x-text="(status.system?.disk_percent || 0).toFixed(1) + '%'"></p>
+            <p class="text-xs text-gray-500 mt-1" x-text="formatBytes(status.system?.disk_free) + ' free'"></p>
+        </div>
+        <div class="card">
+            <p class="text-xs text-gray-500 mb-2">Uptime</p>
+            <p class="stat-value text-xl" x-text="formatDuration(status.system?.uptime_seconds)"></p>
+        </div>
+    </div>
+
+    <!-- Recent Queue -->
+    <div class="card">
+        <div class="card-header">
+            <h3 class="card-title">Recent Jobs</h3>
+            <a href="/queue" class="text-accent text-sm font-semibold hover:underline">View All →</a>
+        </div>
+        <div class="table-container" x-show="recentJobs.length > 0">
+            <table>
+                <thead>
+                    <tr>
+                        <th>File</th>
+                        <th>Status</th>
+                        <th>Progress</th>
+                        <th>Time</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="job in recentJobs.slice(0, 5)" :key="job.id">
+                        <tr>
+                            <td class="font-medium text-white truncate max-w-[200px]" x-text="job.filename"></td>
+                            <td x-html="statusBadge(job.status)"></td>
+                            <td>
+                                <div class="flex items-center gap-2">
+                                    <div class="progress-bar w-20">
+                                        <div class="progress-fill" :style="`width: ${job.progress}%`"></div>
+                                    </div>
+                                    <span class="text-xs text-gray-400" x-text="Math.round(job.progress) + '%'"></span>
+                                </div>
+                            </td>
+                            <td class="text-gray-400 text-xs" x-text="timeAgo(job.created_at)"></td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+        </div>
+        <p x-show="recentJobs.length === 0" class="text-gray-600 text-center py-4">No jobs yet</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function dashboardApp() {
+    return {
+        status: {},
+        recentJobs: [],
+        pollInterval: null,
+
+        async init() {
+            await this.fetchStatus();
+            await this.fetchQueue();
+
+            // Poll for updates
+            this.pollInterval = setInterval(() => {
+                this.fetchStatus();
+                this.fetchQueue();
+            }, 3000);
+
+            // WebSocket updates
+            ws.on('job_status', (data) => { this.fetchQueue(); });
+            ws.on('job_progress', (data) => { this.fetchQueue(); });
+            ws.on('job_complete', (data) => {
+                this.fetchStatus();
+                this.fetchQueue();
+                showToast(`Job completed: ${data.filename}`, 'success');
+            });
+            ws.on('job_failed', (data) => {
+                this.fetchStatus();
+                this.fetchQueue();
+                showToast(`Job failed: ${data.error}`, 'error');
+            });
+            ws.on('health', (data) => {
+                // Update health in status
+                if (this.status.watchdog) {
+                    this.status.watchdog.workers = data;
+                }
+            });
+        },
+
+        async fetchStatus() {
+            try {
+                this.status = await api('/api/dashboard/status');
+            } catch (e) {}
+        },
+
+        async fetchQueue() {
+            try {
+                this.recentJobs = await api('/api/queue/');
+            } catch (e) {}
+        },
+
+        statusDotClass(state) {
+            const map = {
+                ready: 'green', connected: 'green',
+                connecting: 'yellow', starting: 'yellow',
+                wait_code: 'yellow', wait_2fa: 'yellow',
+                error: 'red',
+                idle: 'gray', disabled: 'gray',
+            };
+            return map[state] || 'gray';
+        },
+
+        formatBytes, formatDuration, formatNumber, timeAgo, statusBadge,
+    };
+}
+</script>
+{% endblock %}

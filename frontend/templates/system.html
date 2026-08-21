@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+{% block title %}System — Snickerdoodle Checker{% endblock %}
+
+{% block content %}
+<div x-data="systemApp()" x-init="init()">
+    <div class="flex items-center justify-between mb-6">
+        <h2 class="text-2xl font-bold text-white">System Status</h2>
+        {% if user.role == 'admin' %}
+        <button @click="emergencyReset()" class="btn btn-danger">⚠ Emergency Reset</button>
+        {% endif %}
+    </div>
+
+    <!-- Worker Status Grid -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
+        <template x-for="[name, w] in Object.entries(workers)" :key="name">
+            <div class="card">
+                <div class="flex items-center justify-between mb-3">
+                    <div class="flex items-center gap-2">
+                        <span class="status-dot" :class="w.healthy ? 'green' : 'red'"></span>
+                        <h3 class="font-bold text-white" x-text="name"></h3>
+                    </div>
+                    {% if user.role in ['admin', 'operator'] %}
+                    <button @click="restartWorker(name)" class="btn btn-sm btn-ghost" title="Restart">↻ Restart</button>
+                    {% endif %}
+                </div>
+                <div class="space-y-2 text-sm">
+                    <div class="flex justify-between">
+                        <span class="text-gray-500">Status</span>
+                        <span class="font-medium" :class="w.healthy ? 'text-green-400' : 'text-red-400'"
+                              x-text="w.healthy ? 'Healthy' : 'Unhealthy'"></span>
+                    </div>
+                    <div class="flex justify-between">
+                        <span class="text-gray-500">Last Check</span>
+                        <span class="text-gray-300" x-text="w.last_check ? timeAgo(w.last_check) : '—'"></span>
+                    </div>
+                    <div class="flex justify-between" x-show="w.restart_count > 0">
+                        <span class="text-gray-500">Restarts</span>
+                        <span class="text-yellow-400" x-text="w.restart_count"></span>
+                    </div>
+                    <div x-show="w.last_error" class="mt-2 p-2 bg-red-500/10 rounded-lg border border-red-500/20">
+                        <p class="text-xs text-red-300" x-text="w.last_error"></p>
+                    </div>
+                </div>
+            </div>
+        </template>
+    </div>
+
+    <!-- Detailed Service Status -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        <!-- Telegram Details -->
+        <div class="card">
+            <h3 class="card-title mb-4">Telegram Details</h3>
+            <div class="space-y-2 text-sm">
+                <div class="flex justify-between">
+                    <span class="text-gray-500">State</span>
+                    <span class="text-white capitalize" x-text="status.telegram?.state || 'idle'"></span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Configured</span>
+                    <span :class="status.telegram?.configured ? 'text-green-400' : 'text-gray-500'"
+                          x-text="status.telegram?.configured ? 'Yes' : 'No'"></span>
+                </div>
+                <div class="flex justify-between" x-show="status.telegram?.user">
+                    <span class="text-gray-500">User</span>
+                    <span class="text-white" x-text="status.telegram?.user?.first_name || ''"></span>
+                </div>
+                <div class="flex justify-between" x-show="status.telegram?.channels?.length">
+                    <span class="text-gray-500">Monitoring</span>
+                    <span class="text-white" x-text="(status.telegram?.channels?.length || 0) + ' channel(s)'"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Discord Details -->
+        <div class="card">
+            <h3 class="card-title mb-4">Discord Details</h3>
+            <div class="space-y-2 text-sm">
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Webhook</span>
+                    <span :class="status.discord?.configured ? 'text-green-400' : 'text-gray-500'"
+                          x-text="status.discord?.configured ? 'Configured' : 'Not configured'"></span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Messages Sent</span>
+                    <span class="text-white" x-text="status.discord?.messages_sent || 0"></span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Last Success</span>
+                    <span class="text-gray-300" x-text="status.discord?.last_success ? timeAgo(status.discord.last_success) : '—'"></span>
+                </div>
+                <div x-show="status.discord?.last_error" class="mt-2 p-2 bg-red-500/10 rounded-lg border border-red-500/20">
+                    <p class="text-xs text-red-300" x-text="status.discord?.last_error"></p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Cloudflare Details -->
+        <div class="card">
+            <h3 class="card-title mb-4">Cloudflare Tunnel</h3>
+            <div class="space-y-2 text-sm">
+                <div class="flex justify-between">
+                    <span class="text-gray-500">State</span>
+                    <span class="text-white capitalize" x-text="status.cloudflare?.state || 'idle'"></span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Domain</span>
+                    <span class="text-blue-400" x-text="status.cloudflare?.domain || '—'"></span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Configured</span>
+                    <span :class="status.cloudflare?.configured ? 'text-green-400' : 'text-gray-500'"
+                          x-text="status.cloudflare?.configured ? 'Yes' : 'No'"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Checker Details -->
+        <div class="card">
+            <h3 class="card-title mb-4">Checker</h3>
+            <div class="space-y-2 text-sm">
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Status</span>
+                    <span :class="status.checker?.running ? 'text-blue-400' : 'text-gray-400'"
+                          x-text="status.checker?.running ? 'Running' : 'Idle'"></span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Current Job</span>
+                    <span class="text-white font-mono text-xs" x-text="status.checker?.current_job?.substring(0,8) || '—'"></span>
+                </div>
+                <div class="flex justify-between">
+                    <span class="text-gray-500">Command</span>
+                    <span class="text-gray-300 text-xs truncate max-w-[200px]" x-text="status.checker?.checker_command || '(built-in)'"></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- System Resources -->
+    <div class="card">
+        <h3 class="card-title mb-4">System Resources</h3>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-6">
+            <div>
+                <p class="text-xs text-gray-500 mb-1">CPU Usage</p>
+                <p class="text-2xl font-bold text-white" x-text="(status.system?.cpu_percent || 0).toFixed(1) + '%'"></p>
+                <div class="progress-bar mt-2">
+                    <div class="progress-fill" :style="`width: ${status.system?.cpu_percent || 0}%`"></div>
+                </div>
+            </div>
+            <div>
+                <p class="text-xs text-gray-500 mb-1">Memory</p>
+                <p class="text-2xl font-bold text-white" x-text="formatBytes(status.system?.memory_used)"></p>
+                <p class="text-xs text-gray-500" x-text="'of ' + formatBytes(status.system?.memory_total)"></p>
+            </div>
+            <div>
+                <p class="text-xs text-gray-500 mb-1">Disk Free</p>
+                <p class="text-2xl font-bold text-white" x-text="formatBytes(status.system?.disk_free)"></p>
+                <p class="text-xs text-gray-500" x-text="(status.system?.disk_percent || 0).toFixed(1) + '% used'"></p>
+            </div>
+            <div>
+                <p class="text-xs text-gray-500 mb-1">Uptime</p>
+                <p class="text-2xl font-bold text-white" x-text="formatDuration(status.system?.uptime_seconds)"></p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function systemApp() {
+    return {
+        status: {},
+        workers: {},
+
+        async init() {
+            await this.fetchStatus();
+            setInterval(() => this.fetchStatus(), 5000);
+            ws.on('health', (data) => { this.workers = data; });
+        },
+
+        async fetchStatus() {
+            try {
+                this.status = await api('/api/dashboard/status');
+                this.workers = this.status.watchdog?.workers || {};
+            } catch (e) {}
+        },
+
+        async restartWorker(name) {
+            if (await confirmAction(`Restart ${name}`, `This will restart only the ${name} worker. Current downloads will not be affected.`)) {
+                try {
+                    const res = await api('/api/workers/restart', {
+                        method: 'POST',
+                        body: JSON.stringify({ worker: name }),
+                    });
+                    showToast(res.message || `${name} restarted`, 'success');
+                    this.fetchStatus();
+                } catch (e) {
+                    showToast(`Failed to restart ${name}: ${e.message}`, 'error');
+                }
+            }
+        },
+
+        async emergencyReset() {
+            if (await confirmAction('⚠ EMERGENCY RESET', 'This will stop all workers, clean temp files, reset stuck jobs, and restart everything. Permanent data will NOT be deleted.')) {
+                try {
+                    const res = await api('/api/workers/emergency-reset', { method: 'POST' });
+                    showToast('Emergency reset complete', 'warning');
+                    this.fetchStatus();
+                } catch (e) {
+                    showToast(`Reset failed: ${e.message}`, 'error');
+                }
+            }
+        },
+
+        formatBytes, formatDuration, timeAgo,
+    };
+}
+</script>
+{% endblock %}

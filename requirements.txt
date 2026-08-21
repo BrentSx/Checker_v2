@@ -1,0 +1,32 @@
+# Core web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+jinja2==3.1.5
+itsdangerous==2.2.0
+websockets==14.2
+
+# Database
+sqlalchemy==2.0.37
+aiosqlite==0.20.0
+
+# Authentication
+bcrypt==4.2.1
+python-jose[cryptography]==3.3.0
+
+# Telegram
+telethon==1.38.1
+
+# HTTP client for Discord/downloads
+aiohttp==3.11.12
+aiofiles==24.1.0
+
+# Archive extraction
+rarfile==4.2
+py7zr==0.22.0
+
+# System monitoring
+psutil==6.1.1
+
+# Environment variables
+python-dotenv==1.0.1

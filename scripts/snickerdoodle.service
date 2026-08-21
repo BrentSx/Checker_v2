@@ -1,0 +1,21 @@
+[Unit]
+Description=Snickerdoodle Checker v2.0
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/audo_check
+ExecStart=/opt/audo_check/start.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/audo_check
+
+[Install]
+WantedBy=multi-user.target

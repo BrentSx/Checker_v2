@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block title %}Users — Snickerdoodle Checker{% endblock %}
+
+{% block content %}
+<div x-data="usersApp()" x-init="init()">
+    <div class="flex items-center justify-between mb-6">
+        <h2 class="text-2xl font-bold text-white">User Management</h2>
+        <button @click="showCreateModal = true" class="btn btn-primary">+ Add User</button>
+    </div>
+
+    <!-- Users Table -->
+    <div class="card">
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Username</th>
+                        <th>Role</th>
+                        <th>Status</th>
+                        <th>Created</th>
+                        <th>Last Login</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="u in users" :key="u.id">
+                        <tr>
+                            <td class="font-bold text-white" x-text="u.username"></td>
+                            <td>
+                                <span class="badge" :class="u.role === 'admin' ? 'badge-red' : u.role === 'operator' ? 'badge-yellow' : 'badge-gray'"
+                                      x-text="u.role.toUpperCase()"></span>
+                            </td>
+                            <td>
+                                <span class="badge" :class="u.is_active ? 'badge-green' : 'badge-gray'"
+                                      x-text="u.is_active ? 'Active' : 'Disabled'"></span>
+                            </td>
+                            <td class="text-gray-400 text-xs" x-text="timeAgo(u.created_at)"></td>
+                            <td class="text-gray-400 text-xs" x-text="u.last_login ? timeAgo(u.last_login) : 'Never'"></td>
+                            <td>
+                                <div class="flex gap-1">
+                                    <button @click="editUser(u)" class="btn btn-sm btn-ghost">Edit</button>
+                                    <button @click="deleteUser(u)" class="btn btn-sm btn-danger"
+                                            x-show="u.username !== '{{ user.user }}'">Delete</button>
+                                </div>
+                            </td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Permission Levels Reference -->
+    <div class="card mt-6">
+        <h3 class="card-title mb-4">Permission Levels</h3>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div class="p-4 bg-dark-200 rounded-lg border border-red-500/20">
+                <h4 class="font-bold text-red-400 mb-2">Admin</h4>
+                <ul class="text-xs text-gray-400 space-y-1">
+                    <li>• Full dashboard access</li>
+                    <li>• Queue & worker controls</li>
+                    <li>• All settings & configuration</li>
+                    <li>• User management</li>
+                    <li>• Emergency reset</li>
+                </ul>
+            </div>
+            <div class="p-4 bg-dark-200 rounded-lg border border-yellow-500/20">
+                <h4 class="font-bold text-yellow-400 mb-2">Operator</h4>
+                <ul class="text-xs text-gray-400 space-y-1">
+                    <li>• View dashboard & queue</li>
+                    <li>• Pause/resume processing</li>
+                    <li>• Retry & restart workers</li>
+                    <li>• View logs</li>
+                    <li>• Cannot manage users/settings</li>
+                </ul>
+            </div>
+            <div class="p-4 bg-dark-200 rounded-lg border border-gray-500/20">
+                <h4 class="font-bold text-gray-400 mb-2">Viewer</h4>
+                <ul class="text-xs text-gray-400 space-y-1">
+                    <li>• View dashboard</li>
+                    <li>• View queue status</li>
+                    <li>• View logs</li>
+                    <li>• No control access</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Modal -->
+    <div x-show="showCreateModal" class="modal-overlay" x-transition.opacity>
+        <div class="modal" @click.stop>
+            <h3 class="text-lg font-bold text-white mb-4" x-text="editing ? 'Edit User' : 'Create User'"></h3>
+            <div class="space-y-4">
+                <div x-show="!editing">
+                    <label class="input-label">Username</label>
+                    <input type="text" x-model="newUser.username" class="input" placeholder="username">
+                </div>
+                <div>
+                    <label class="input-label" x-text="editing ? 'New Password (leave empty to keep)' : 'Password'"></label>
+                    <input type="password" x-model="newUser.password" class="input" placeholder="••••••">
+                </div>
+                <div>
+                    <label class="input-label">Role</label>
+                    <select x-model="newUser.role" class="input">
+                        <option value="viewer">Viewer</option>
+                        <option value="operator">Operator</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                </div>
+                <div x-show="editing" class="flex items-center gap-2">
+                    <input type="checkbox" x-model="newUser.is_active" id="userActive" class="rounded">
+                    <label for="userActive" class="text-sm text-gray-300">Active</label>
+                </div>
+            </div>
+            <div class="flex gap-3 justify-end mt-6">
+                <button @click="showCreateModal = false; editing = null;" class="btn btn-ghost">Cancel</button>
+                <button @click="saveUser()" class="btn btn-primary" x-text="editing ? 'Save' : 'Create'"></button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function usersApp() {
+    return {
+        users: [],
+        showCreateModal: false,
+        editing: null,
+        newUser: { username: '', password: '', role: 'viewer', is_active: true },
+
+        async init() { await this.fetchUsers(); },
+
+        async fetchUsers() {
+            try { this.users = await api('/api/users/'); } catch(e) {}
+        },
+
+        editUser(u) {
+            this.editing = u;
+            this.newUser = { username: u.username, password: '', role: u.role, is_active: u.is_active };
+            this.showCreateModal = true;
+        },
+
+        async saveUser() {
+            try {
+                if (this.editing) {
+                    const body = { role: this.newUser.role, is_active: this.newUser.is_active };
+                    if (this.newUser.password) body.new_password = this.newUser.password;
+                    await api(`/api/users/${this.editing.id}`, { method: 'PUT', body: JSON.stringify(body) });
+                    showToast('User updated', 'success');
+                } else {
+                    await api('/api/users/', { method: 'POST', body: JSON.stringify(this.newUser) });
+                    showToast('User created', 'success');
+                }
+                this.showCreateModal = false;
+                this.editing = null;
+                this.newUser = { username: '', password: '', role: 'viewer', is_active: true };
+                this.fetchUsers();
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        },
+
+        async deleteUser(u) {
+            if (await confirmAction('Delete User', `Are you sure you want to delete "${u.username}"?`)) {
+                try {
+                    await api(`/api/users/${u.id}`, { method: 'DELETE' });
+                    showToast('User deleted', 'info');
+                    this.fetchUsers();
+                } catch (e) {
+                    showToast(e.message, 'error');
+                }
+            }
+        },
+
+        timeAgo,
+    };
+}
+</script>
+{% endblock %}

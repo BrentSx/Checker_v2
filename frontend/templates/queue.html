@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+{% block title %}Queue — Snickerdoodle Checker{% endblock %}
+
+{% block content %}
+<div x-data="queueApp()" x-init="init()">
+    <div class="flex items-center justify-between mb-6">
+        <h2 class="text-2xl font-bold text-white">Queue</h2>
+        <div class="flex gap-2">
+            {% if user.role in ['admin', 'operator'] %}
+            <button @click="togglePause()" class="btn btn-sm" :class="paused ? 'btn-success' : 'btn-warning'">
+                <span x-text="paused ? '▶ Resume' : '⏸ Pause'"></span>
+            </button>
+            <button @click="clearCompleted()" class="btn btn-sm btn-ghost">Clear Completed</button>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Queue Stats -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        <div class="card text-center">
+            <p class="stat-value" x-text="stats.queued"></p>
+            <p class="stat-label">Queued</p>
+        </div>
+        <div class="card text-center">
+            <p class="stat-value text-blue-400" x-text="stats.active"></p>
+            <p class="stat-label">Processing</p>
+        </div>
+        <div class="card text-center">
+            <p class="stat-value text-green-400" x-text="stats.completed"></p>
+            <p class="stat-label">Completed</p>
+        </div>
+        <div class="card text-center">
+            <p class="stat-value text-red-400" x-text="stats.failed"></p>
+            <p class="stat-label">Failed</p>
+        </div>
+    </div>
+
+    <!-- Queue Table -->
+    <div class="card">
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Filename</th>
+                        <th>Status</th>
+                        <th>Size</th>
+                        <th>Progress</th>
+                        <th>Added</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="(job, i) in jobs" :key="job.id">
+                        <tr>
+                            <td class="text-gray-500" x-text="i + 1"></td>
+                            <td>
+                                <div class="max-w-[250px]">
+                                    <p class="font-medium text-white truncate" x-text="job.filename"></p>
+                                    <p class="text-xs text-gray-500 font-mono" x-text="job.id.substring(0, 8)"></p>
+                                </div>
+                            </td>
+                            <td x-html="statusBadge(job.status)"></td>
+                            <td class="text-gray-400 text-sm" x-text="formatBytes(job.file_size)"></td>
+                            <td>
+                                <div class="flex items-center gap-2 min-w-[120px]">
+                                    <div class="progress-bar flex-1">
+                                        <div class="progress-fill" :style="`width: ${job.progress}%`"></div>
+                                    </div>
+                                    <span class="text-xs text-gray-400 w-10 text-right" x-text="Math.round(job.progress) + '%'"></span>
+                                </div>
+                            </td>
+                            <td class="text-gray-400 text-xs whitespace-nowrap" x-text="timeAgo(job.created_at)"></td>
+                            <td>
+                                <div class="flex gap-1">
+                                    {% if user.role in ['admin', 'operator'] %}
+                                    <button x-show="job.status === 'failed'"
+                                            @click="retryJob(job.id)" class="btn btn-sm btn-success" title="Retry">↻</button>
+                                    <button x-show="job.status === 'queued'"
+                                            @click="cancelJob(job.id)" class="btn btn-sm btn-danger" title="Cancel">✕</button>
+                                    {% endif %}
+                                </div>
+                            </td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+        </div>
+        <p x-show="jobs.length === 0" class="text-gray-600 text-center py-8">Queue is empty</p>
+    </div>
+
+    <!-- Error Details -->
+    <template x-for="job in jobs.filter(j => j.status === 'failed' && j.error_message)" :key="'err-'+job.id">
+        <div class="card mt-4 border-red-500/30">
+            <div class="flex items-center gap-2 mb-2">
+                <span class="text-red-400 font-bold">✗</span>
+                <span class="font-bold text-white" x-text="job.filename"></span>
+                <span class="badge badge-red">FAILED</span>
+            </div>
+            <p class="text-sm text-red-300 font-mono bg-dark-200 rounded-lg p-3" x-text="job.error_message"></p>
+            <div class="flex gap-2 mt-3">
+                <span class="text-xs text-gray-500">Retry <span x-text="job.retry_count"></span> / <span x-text="job.max_retries || 3"></span></span>
+                {% if user.role in ['admin', 'operator'] %}
+                <button @click="retryJob(job.id)" class="btn btn-sm btn-success">Retry Now</button>
+                {% endif %}
+            </div>
+        </div>
+    </template>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function queueApp() {
+    return {
+        jobs: [],
+        paused: false,
+        stats: { queued: 0, active: 0, completed: 0, failed: 0 },
+
+        async init() {
+            await this.fetchQueue();
+            setInterval(() => this.fetchQueue(), 3000);
+            ws.on('queue_update', () => this.fetchQueue());
+            ws.on('job_status', () => this.fetchQueue());
+            ws.on('job_progress', () => this.fetchQueue());
+            ws.on('job_complete', () => this.fetchQueue());
+        },
+
+        async fetchQueue() {
+            try {
+                this.jobs = await api('/api/queue/');
+                this.stats = {
+                    queued: this.jobs.filter(j => j.status === 'queued').length,
+                    active: this.jobs.filter(j => !['queued','completed','failed','cancelled'].includes(j.status)).length,
+                    completed: this.jobs.filter(j => j.status === 'completed').length,
+                    failed: this.jobs.filter(j => j.status === 'failed').length,
+                };
+            } catch (e) {}
+        },
+
+        async togglePause() {
+            const endpoint = this.paused ? '/api/queue/resume' : '/api/queue/pause';
+            await api(endpoint, { method: 'POST' });
+            this.paused = !this.paused;
+            showToast(this.paused ? 'Queue paused' : 'Queue resumed', 'info');
+        },
+
+        async retryJob(id) {
+            await api(`/api/queue/retry/${id}`, { method: 'POST' });
+            showToast('Job re-queued', 'success');
+            this.fetchQueue();
+        },
+
+        async cancelJob(id) {
+            if (await confirmAction('Cancel Job', 'Are you sure you want to cancel this job?')) {
+                await api(`/api/queue/cancel/${id}`, { method: 'POST' });
+                showToast('Job cancelled', 'info');
+                this.fetchQueue();
+            }
+        },
+
+        async clearCompleted() {
+            await api('/api/queue/clear-completed', { method: 'POST' });
+            showToast('Completed jobs cleared', 'info');
+            this.fetchQueue();
+        },
+
+        formatBytes, formatDuration, formatNumber, timeAgo, statusBadge,
+    };
+}
+</script>
+{% endblock %}

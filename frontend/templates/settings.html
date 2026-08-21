@@ -1,0 +1,214 @@
+{% extends "base.html" %}
+{% block title %}Settings — Snickerdoodle Checker{% endblock %}
+
+{% block content %}
+<div x-data="settingsApp()" x-init="init()">
+    <h2 class="text-2xl font-bold text-white mb-6">Settings</h2>
+
+    <!-- Tabs -->
+    <div class="flex gap-1 mb-6 border-b border-dark-300 overflow-x-auto">
+        <template x-for="tab in tabs" :key="tab.id">
+            <button @click="activeTab = tab.id"
+                    class="px-4 py-2.5 text-sm font-semibold whitespace-nowrap transition-all border-b-2"
+                    :class="activeTab === tab.id ? 'text-accent border-accent' : 'text-gray-500 border-transparent hover:text-gray-300'">
+                <span x-text="tab.label"></span>
+            </button>
+        </template>
+    </div>
+
+    <!-- Telegram Settings -->
+    <div x-show="activeTab === 'telegram'" class="card">
+        <h3 class="text-lg font-bold text-white mb-4">Telegram Configuration</h3>
+        <div class="space-y-4 max-w-lg">
+            <div>
+                <label class="input-label">API ID</label>
+                <input type="number" x-model="form.telegram_api_id" class="input" placeholder="12345678">
+            </div>
+            <div>
+                <label class="input-label">API Hash</label>
+                <input type="text" x-model="form.telegram_api_hash" class="input" placeholder="abc123...">
+            </div>
+            <div>
+                <label class="input-label">Phone Number</label>
+                <input type="text" x-model="form.telegram_phone" class="input" placeholder="+1234567890">
+            </div>
+            <div>
+                <label class="input-label">Channel IDs (comma-separated)</label>
+                <input type="text" x-model="form.telegram_channel_ids" class="input" placeholder="-1001234567890">
+            </div>
+            <div class="flex gap-2">
+                <button @click="saveSettings('telegram')" class="btn btn-primary">Save</button>
+                <button @click="testTelegram()" class="btn btn-ghost">Connect</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Discord Settings -->
+    <div x-show="activeTab === 'discord'" class="card">
+        <h3 class="text-lg font-bold text-white mb-4">Discord Configuration</h3>
+        <div class="space-y-4 max-w-lg">
+            <div>
+                <label class="input-label">Webhook URL</label>
+                <input type="text" x-model="form.discord_webhook_url" class="input" placeholder="https://discord.com/api/webhooks/...">
+            </div>
+            <div>
+                <label class="input-label">Max File Size (MB)</label>
+                <input type="number" x-model="form.discord_max_file_size" class="input" placeholder="25">
+            </div>
+            <div class="flex gap-2">
+                <button @click="saveSettings('discord')" class="btn btn-primary">Save</button>
+                <button @click="testDiscord()" class="btn btn-ghost">Test Webhook</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Checker Settings -->
+    <div x-show="activeTab === 'checker'" class="card">
+        <h3 class="text-lg font-bold text-white mb-4">Checker Configuration</h3>
+        <div class="space-y-4 max-w-lg">
+            <div>
+                <label class="input-label">Checker Command</label>
+                <input type="text" x-model="form.checker_command" class="input" placeholder="Leave empty for built-in scanner">
+                <p class="text-xs text-gray-500 mt-1">Use {input} for input dir and {output} for output dir placeholders</p>
+            </div>
+            <div>
+                <label class="input-label">Workers</label>
+                <input type="number" x-model="form.checker_workers" class="input" placeholder="20">
+            </div>
+            <div>
+                <label class="input-label">Proxy File</label>
+                <input type="text" x-model="form.proxy_file" class="input" placeholder="Path to proxy list file">
+            </div>
+            <button @click="saveSettings('checker')" class="btn btn-primary">Save</button>
+        </div>
+    </div>
+
+    <!-- Cloudflare Settings -->
+    <div x-show="activeTab === 'cloudflare'" class="card">
+        <h3 class="text-lg font-bold text-white mb-4">Cloudflare Tunnel</h3>
+        <div class="space-y-4 max-w-lg">
+            <div>
+                <label class="input-label">Domain</label>
+                <input type="text" x-model="form.cloudflare_domain" class="input" placeholder="checker.ravealts.com">
+            </div>
+            <div>
+                <label class="input-label">Tunnel Token</label>
+                <input type="password" x-model="form.cloudflare_tunnel_token" class="input" placeholder="Cloudflare tunnel token">
+            </div>
+            <button @click="saveSettings('cloudflare')" class="btn btn-primary">Save</button>
+        </div>
+    </div>
+
+    <!-- Queue Settings -->
+    <div x-show="activeTab === 'queue'" class="card">
+        <h3 class="text-lg font-bold text-white mb-4">Queue & Downloads</h3>
+        <div class="space-y-4 max-w-lg">
+            <div>
+                <label class="input-label">Max Retries</label>
+                <input type="number" x-model="form.max_retries" class="input" placeholder="3">
+            </div>
+            <div>
+                <label class="input-label">Retry Delay (seconds)</label>
+                <input type="number" x-model="form.retry_delay" class="input" placeholder="30">
+            </div>
+            <div>
+                <label class="input-label">Download Directory</label>
+                <input type="text" x-model="form.download_dir" class="input" placeholder="./downloads">
+            </div>
+            <div>
+                <label class="input-label">Temp Directory</label>
+                <input type="text" x-model="form.temp_dir" class="input" placeholder="./temp">
+            </div>
+            <button @click="saveSettings('queue')" class="btn btn-primary">Save</button>
+        </div>
+    </div>
+
+    <!-- Logging Settings -->
+    <div x-show="activeTab === 'logging'" class="card">
+        <h3 class="text-lg font-bold text-white mb-4">Logging</h3>
+        <div class="space-y-4 max-w-lg">
+            <div>
+                <label class="input-label">Log Level</label>
+                <select x-model="form.log_level" class="input">
+                    <option value="DEBUG">DEBUG</option>
+                    <option value="INFO">INFO</option>
+                    <option value="WARNING">WARNING</option>
+                    <option value="ERROR">ERROR</option>
+                </select>
+            </div>
+            <div>
+                <label class="input-label">Max Log File Size (MB)</label>
+                <input type="number" x-model="form.log_max_size" class="input" placeholder="50">
+            </div>
+            <button @click="saveSettings('logging')" class="btn btn-primary">Save</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function settingsApp() {
+    return {
+        activeTab: 'telegram',
+        tabs: [
+            { id: 'telegram', label: 'Telegram' },
+            { id: 'discord', label: 'Discord' },
+            { id: 'checker', label: 'Checker' },
+            { id: 'cloudflare', label: 'Cloudflare' },
+            { id: 'queue', label: 'Queue' },
+            { id: 'logging', label: 'Logging' },
+        ],
+        form: {},
+
+        async init() {
+            try {
+                this.form = await api('/api/settings/');
+            } catch (e) {
+                this.form = {};
+            }
+        },
+
+        async saveSettings(section) {
+            try {
+                await api('/api/settings/', {
+                    method: 'POST',
+                    body: JSON.stringify({ settings: this.form }),
+                });
+                showToast(`${section} settings saved`, 'success');
+            } catch (e) {
+                showToast(`Failed to save: ${e.message}`, 'error');
+            }
+        },
+
+        async testTelegram() {
+            try {
+                await api('/api/workers/telegram/start', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        api_id: parseInt(this.form.telegram_api_id) || 0,
+                        api_hash: this.form.telegram_api_hash || '',
+                        phone: this.form.telegram_phone || '',
+                    }),
+                });
+                showToast('Telegram connection started', 'info');
+            } catch (e) {
+                showToast(`Telegram error: ${e.message}`, 'error');
+            }
+        },
+
+        async testDiscord() {
+            try {
+                await api('/api/workers/restart', {
+                    method: 'POST',
+                    body: JSON.stringify({ worker: 'Discord' }),
+                });
+                showToast('Discord test message sent', 'success');
+            } catch (e) {
+                showToast(`Discord error: ${e.message}`, 'error');
+            }
+        },
+    };
+}
+</script>
+{% endblock %}
