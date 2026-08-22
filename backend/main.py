@@ -59,6 +59,22 @@ async def lifespan(app: FastAPI):
     from backend.services.telegram_service import telegram_service
     from backend.services.cloudflare_service import cloudflare_service
 
+    # Load Discord webhook from DB settings (overrides .env if set)
+    from backend.services.discord_service import discord_service
+    try:
+        from backend.models import Setting
+        from sqlalchemy import select as sa_select
+        async with async_session() as session:
+            result = await session.execute(
+                sa_select(Setting).where(Setting.key == "discord_webhook_url")
+            )
+            setting = result.scalar_one_or_none()
+            if setting and setting.value:
+                discord_service.configure(setting.value)
+                log.info("Discord webhook loaded from DB settings")
+    except Exception as e:
+        log.warning(f"Failed to load Discord webhook from DB: {e}")
+
     await queue_manager.start()
     await watchdog.start()
 

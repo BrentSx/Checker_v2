@@ -547,6 +547,151 @@ class QueueManager:
                 await session.commit()
                 log.info(f"Job {job_id[:8]} re-queued for retry")
 
+    async def retest_job(self, job_id: str) -> bool:
+        """Re-run extract→check→discord on an already-downloaded file.
+
+        Skips the download entirely.  Returns False if no file on disk.
+        """
+        async with async_session() as session:
+            result = await session.execute(select(Job).where(Job.id == job_id))
+            job = result.scalar_one_or_none()
+            if not job:
+                return False
+
+            # Must have a file on disk
+            if not job.download_path or not os.path.exists(job.download_path):
+                return False
+
+            # Reset the job for reprocessing
+            job.status = JobStatus.downloaded  # skip download, start at extract
+            job.retry_count = 0
+            job.error_message = None
+            job.progress = 0.0
+            job.files_checked = 0
+            job.files_extracted = 0
+            job.discord_sent = False
+            job.cleanup_done = False
+            job.completed_at = None
+            job.results_summary = None
+            await session.commit()
+
+            log.info(f"Job {job_id[:8]} queued for RETEST (skipping download)")
+
+            # Kick off the retest in a task
+            asyncio.create_task(self._retest_pipeline(job_id, job.download_path))
+            return True
+
+    async def _retest_pipeline(self, job_id: str, download_path: str):
+        """Run extract→check→discord→cleanup without downloading."""
+        log_j = log.with_job(job_id)
+        start_time = time.time()
+
+        try:
+            # Fetch fresh job data
+            async with async_session() as session:
+                result = await session.execute(select(Job).where(Job.id == job_id))
+                job = result.scalar_one_or_none()
+                if not job:
+                    return
+
+            log_j.info(f"RETEST started for {job.filename} (file on disk)")
+
+            # 1. Extract
+            await self._update_status(job_id, JobStatus.extracting)
+            archive_password = await self._get_job_password(job_id)
+            if archive_password:
+                log_j.info(f"Extracting with password: {job.filename}")
+            else:
+                log_j.info(f"Extracting: {job.filename}")
+            extract_dir = str(TEMP_DIR / f"job_{job_id[:8]}")
+            files_extracted = await extract_archive(download_path, extract_dir, password=archive_password)
+            log_j.info(f"Extracted {files_extracted} files")
+            await self._update_job(job_id, {
+                "extract_dir": extract_dir,
+                "files_extracted": files_extracted,
+                "files_total": files_extracted,
+            })
+
+            # 2. Check
+            await self._update_status(job_id, JobStatus.checking)
+            log_j.info("Running checker...")
+
+            async def on_progress(processed, total):
+                await self._update_job(job_id, {
+                    "files_checked": processed,
+                    "files_total": total,
+                    "progress": (processed / total * 100) if total > 0 else 0,
+                })
+                await hub.broadcast("job_progress", {
+                    "job_id": job_id,
+                    "files_checked": processed,
+                    "files_total": total,
+                    "progress": (processed / total * 100) if total > 0 else 0,
+                })
+
+            checker_result = await checker_service.run_check(extract_dir, job_id, on_progress)
+
+            await self._update_job(job_id, {
+                "status": JobStatus.processing_results,
+                "results_summary": checker_result.to_dict(),
+                "files_checked": checker_result.total,
+            })
+
+            # 3. Discord
+            await self._update_status(job_id, JobStatus.sending_discord)
+            log_j.info("Sending results to Discord...")
+
+            elapsed = time.time() - start_time
+            processing_time = _format_duration(elapsed)
+
+            results_zip_data = None
+            if checker_result.results_dir and os.path.exists(checker_result.results_dir):
+                results_zip_data = _create_zip(checker_result.results_dir)
+
+            discord_ok = await discord_service.send_job_result(
+                filename=job.filename,
+                job_id=job_id,
+                status="completed",
+                results_summary=checker_result.to_dict(),
+                processing_time=processing_time,
+                results_zip_data=results_zip_data,
+            )
+
+            await self._update_job(job_id, {"discord_sent": discord_ok})
+
+            # 4. Cleanup (extracted files only — keep the download)
+            await self._update_status(job_id, JobStatus.cleaning_up)
+            if extract_dir and os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir, ignore_errors=True)
+
+            # 5. Done
+            await self._update_job(job_id, {
+                "status": JobStatus.completed,
+                "completed_at": datetime.now(timezone.utc),
+                "cleanup_done": True,
+                "progress": 100.0,
+            })
+
+            total_time = time.time() - start_time
+            log_j.info(f"RETEST completed in {_format_duration(total_time)}")
+            await hub.broadcast("job_complete", {"job_id": job_id, "filename": job.filename})
+
+            try:
+                await self._update_stats(job, checker_result, total_time)
+            except Exception as stats_err:
+                log_j.warning(f"Stats update failed (job still completed): {stats_err}")
+
+        except Exception as e:
+            log_j.error(f"RETEST failed: {e}")
+            async with async_session() as session:
+                result = await session.execute(select(Job).where(Job.id == job_id))
+                db_job = result.scalar_one_or_none()
+                if db_job:
+                    db_job.status = JobStatus.failed
+                    db_job.error_message = f"Retest failed: {e}"
+                    await session.commit()
+            await hub.broadcast("job_failed", {"job_id": job_id, "error": str(e)})
+
     async def cancel_job(self, job_id: str):
         """Cancel a queued OR in-progress job."""
         # If it's the currently running job, cancel the task
@@ -632,6 +777,8 @@ class QueueManager:
                     "results_summary": j.results_summary,
                     "discord_sent": j.discord_sent,
                     "queue_position": j.queue_position,
+                    "download_path": j.download_path,
+                    "has_download": bool(j.download_path and os.path.exists(j.download_path)),
                 }
                 for j in jobs
             ]

@@ -81,6 +81,18 @@ async def cancel_job(
     return {"success": True}
 
 
+@router.post("/retest/{job_id}")
+async def retest_job(
+    job_id: str,
+    user: User = Depends(require_role(UserRole.admin, UserRole.operator)),
+):
+    """Retest a job — skip download, run extract→check→discord on the file already on disk."""
+    ok = await queue_manager.retest_job(job_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="No downloaded file on disk for this job")
+    return {"success": True}
+
+
 @router.post("/clear-completed")
 async def clear_completed(
     user: User = Depends(require_role(UserRole.admin, UserRole.operator)),

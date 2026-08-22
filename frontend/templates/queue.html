@@ -85,8 +85,10 @@
                             <td>
                                 <div class="flex gap-1">
                                     {% if user.role in ['admin', 'operator'] %}
+                                    <button x-show="job.has_download && ['failed','completed'].includes(job.status)"
+                                            @click="retestJob(job.id)" class="btn btn-sm btn-primary" title="Retest — skip download, re-run extract→check→discord">🧪</button>
                                     <button x-show="job.status === 'failed'"
-                                            @click="retryJob(job.id)" class="btn btn-sm btn-success" title="Retry">↻</button>
+                                            @click="retryJob(job.id)" class="btn btn-sm btn-success" title="Retry (full)">↻</button>
                                     <button x-show="!['completed','failed','cancelled'].includes(job.status)"
                                             @click="cancelJob(job.id)" class="btn btn-sm btn-danger" title="Cancel">✕</button>
                                     {% endif %}
@@ -172,6 +174,16 @@ function queueApp() {
             await api(endpoint, { method: 'POST' });
             this.paused = !this.paused;
             showToast(this.paused ? 'Queue paused' : 'Queue resumed', 'info');
+        },
+
+        async retestJob(id) {
+            try {
+                await api(`/api/queue/retest/${id}`, { method: 'POST' });
+                showToast('Retest started — skipping download', 'success');
+                this.fetchQueue();
+            } catch (e) {
+                showToast(`Retest failed: ${e.message}`, 'error');
+            }
         },
 
         async retryJob(id) {

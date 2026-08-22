@@ -65,7 +65,19 @@ async def restart_worker(
         return {"success": True, "message": "Checker stopped (will restart on next job)"}
 
     elif body.worker == "Discord":
-        # Discord is stateless, just test the webhook
+        # Reload webhook URL from DB settings before testing
+        from sqlalchemy import select as sa_select
+        from backend.database import async_session
+        from backend.models import Setting
+        async with async_session() as session:
+            result = await session.execute(
+                sa_select(Setting).where(Setting.key == "discord_webhook_url")
+            )
+            setting = result.scalar_one_or_none()
+            if setting and setting.value:
+                discord_service.configure(setting.value)
+                log.info(f"Discord webhook reloaded from settings")
+
         ok = await discord_service.send_message("🔄 Discord connection test")
         return {"success": ok, "message": "Discord reconnected" if ok else "Discord test failed"}
 
