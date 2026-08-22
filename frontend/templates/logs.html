@@ -87,6 +87,11 @@ function logsApp() {
             await this.fetchLogs();
             await this.fetchComponents();
 
+            // If no logs came in, load the last 20 from the API
+            if (this.logs.length === 0) {
+                await this.fetchOldLogs();
+            }
+
             ws.on('log', (entry) => {
                 this.liveLogs++;
                 if (this.matchesFilter(entry)) {
@@ -100,6 +105,13 @@ function logsApp() {
                     }
                 }
             });
+
+            // If still no live logs after 5 seconds, fetch old ones again
+            setTimeout(async () => {
+                if (this.liveLogs === 0 && this.logs.length === 0) {
+                    await this.fetchOldLogs();
+                }
+            }, 5000);
         },
 
         async fetchLogs() {
@@ -116,6 +128,27 @@ function logsApp() {
                         const c = this.$refs.logContainer;
                         if (c) c.scrollTop = c.scrollHeight;
                     });
+                }
+            } catch (e) {}
+        },
+
+        async fetchOldLogs() {
+            try {
+                const params = new URLSearchParams();
+                if (this.filter.level) params.set('level', this.filter.level);
+                if (this.filter.component) params.set('component', this.filter.component);
+                if (this.filter.search) params.set('search', this.filter.search);
+                params.set('limit', '20');
+
+                const old = await api(`/api/logs/?${params}`);
+                if (old.length > 0 && this.logs.length === 0) {
+                    this.logs = old;
+                    if (this.autoScroll) {
+                        this.$nextTick(() => {
+                            const c = this.$refs.logContainer;
+                            if (c) c.scrollTop = c.scrollHeight;
+                        });
+                    }
                 }
             } catch (e) {}
         },
