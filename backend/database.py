@@ -1,6 +1,6 @@
 """SQLAlchemy async engine and session factory."""
 
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.pool import StaticPool
@@ -44,10 +44,24 @@ class Base(DeclarativeBase):
 
 
 async def init_db():
-    """Create all tables."""
+    """Create all tables and run lightweight migrations for new columns."""
     from backend.models import User, Job, Setting, LogEntry, Statistic  # noqa: F401
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # ── Mini-migrations: add columns that create_all can't add to existing tables ──
+    _MIGRATIONS = [
+        ("jobs", "archive_password", "ALTER TABLE jobs ADD COLUMN archive_password VARCHAR(256)"),
+    ]
+    async with engine.begin() as conn:
+        for table, column, ddl in _MIGRATIONS:
+            exists = await conn.run_sync(
+                lambda sync_conn, t=table, c=column: c in [
+                    row[1] for row in sync_conn.execute(text(f"PRAGMA table_info({t})"))
+                ]
+            )
+            if not exists:
+                await conn.execute(text(ddl))
 
 
 async def get_db() -> AsyncSession:
