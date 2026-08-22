@@ -10,7 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import ssl
+
 import aiohttp
+import certifi
 
 from backend.config import DISCORD_WEBHOOK_URL, DISCORD_MAX_FILE_SIZE_MB
 from backend.logging_config import ComponentLogger
@@ -32,7 +35,10 @@ class DiscordService:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            # Use certifi CA bundle — CentOS 7 custom Python can't find system certs
+            ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+            self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
     def configure(self, webhook_url: str):

@@ -286,6 +286,11 @@ class QueueManager:
         os.makedirs(dest_dir, exist_ok=True)
 
         if job.telegram_channel_id and job.telegram_message_id:
+            # Don't waste retries on a disconnected Telegram client
+            if not telegram_service.is_ready:
+                raise RuntimeError(
+                    "Telegram is not connected — waiting for reconnection"
+                )
             # Download from Telegram — track speed via byte deltas
             dl_state = {"last_bytes": 0, "last_time": time.monotonic(), "speed": 0}
 
@@ -333,10 +338,14 @@ class QueueManager:
 
     async def _download_url(self, job: Job, dest_dir: str) -> str:
         """Download a file from a URL."""
+        import ssl
         import aiohttp
+        import certifi
         log_j = log.with_job(job.id)
 
-        async with aiohttp.ClientSession() as session:
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+        async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(job.source_url) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status} downloading {job.source_url}")

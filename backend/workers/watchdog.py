@@ -177,7 +177,25 @@ class Watchdog:
         })
 
     async def _auto_restart(self, name: str, health: WorkerHealth):
-        """Attempt to auto-restart a failed worker."""
+        """Attempt to auto-restart a failed worker.
+
+        Caps at 5 auto-restarts per worker. After that, logs a warning and
+        stops retrying until the worker is manually restarted or a restart
+        clears the counter.
+        """
+        MAX_AUTO_RESTARTS = 5
+
+        if health.restart_count >= MAX_AUTO_RESTARTS:
+            # Only log once when we first hit the cap, not every 15 seconds
+            if health.consecutive_failures == self._max_consecutive_failures:
+                log.error(
+                    f"{name} has hit {MAX_AUTO_RESTARTS} auto-restart cap. "
+                    f"Not retrying — fix the issue and restart manually."
+                )
+            # Reset failures so we don't spam this branch every check cycle
+            health.consecutive_failures = 0
+            return
+
         log.warning(f"{name} has {health.consecutive_failures} consecutive failures. Attempting restart...")
 
         try:
@@ -196,6 +214,12 @@ class Watchdog:
             elif name == "Cloudflare":
                 from backend.services.cloudflare_service import cloudflare_service
                 await cloudflare_service.restart()
+
+            elif name == "Discord":
+                # Discord is stateless — just close and recreate the session
+                from backend.services.discord_service import discord_service
+                await discord_service.close()
+                # Session will be recreated on next send
 
             health.restart_count += 1
             health.consecutive_failures = 0

@@ -21,6 +21,7 @@ tgcrypto==1.2.5
 # HTTP client for Discord/downloads
 aiohttp==3.11.12
 aiofiles==24.1.0
+certifi>=2024.0
 
 # Archive extraction
 rarfile==4.2

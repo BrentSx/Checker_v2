@@ -3,8 +3,12 @@
 import asyncio
 from typing import Optional
 
+from sqlalchemy import select
+
 from backend.logging_config import ComponentLogger
 from backend.config import TELEGRAM_CHANNEL_IDS
+from backend.database import async_session
+from backend.models import Job, JobStatus
 from backend.services.telegram_service import telegram_service
 from backend.workers.queue_manager import queue_manager
 
@@ -74,7 +78,10 @@ class TelegramMonitor:
             self._running = False
 
     async def _startup_scan(self, channel_ids: list[int]):
-        """On startup, find the latest archive file from monitored channels and queue it."""
+        """On startup, find the latest archive file from monitored channels and queue it.
+
+        Checks the database first so restarts don't create duplicate jobs.
+        """
         log.info("Startup scan: looking for latest archive in monitored channels...")
 
         ARCHIVE_EXTS = (".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz")
@@ -92,6 +99,14 @@ class TelegramMonitor:
                     key = (channel_id, msg["id"])
                     if key in self._processed_messages:
                         continue
+
+                    # Check if a job for this exact message already exists in the DB
+                    already_exists = await self._job_exists(channel_id, msg["id"])
+                    if already_exists:
+                        self._processed_messages.add(key)
+                        log.info(f"Startup scan: skipping {fname} (already in queue)")
+                        break
+
                     self._processed_messages.add(key)
 
                     log.info(f"Startup scan found: {fname} ({msg.get('file_size', 0)} bytes)")
@@ -106,6 +121,17 @@ class TelegramMonitor:
 
             except Exception as e:
                 log.warning(f"Startup scan failed for channel {channel_id}: {e}")
+
+    async def _job_exists(self, channel_id: int, message_id: int) -> bool:
+        """Check if a job for this Telegram message already exists (any status)."""
+        async with async_session() as session:
+            result = await session.execute(
+                select(Job.id).where(
+                    Job.telegram_channel_id == channel_id,
+                    Job.telegram_message_id == message_id,
+                ).limit(1)
+            )
+            return result.scalar_one_or_none() is not None
 
     async def _on_new_file(
         self, channel_id: int, message_id: int, filename: str, file_size: int
