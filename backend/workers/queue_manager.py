@@ -293,6 +293,13 @@ class QueueManager:
         dest_dir = str(DOWNLOAD_DIR)
         os.makedirs(dest_dir, exist_ok=True)
 
+        # Skip re-download if the file already exists on disk (e.g. retry after extraction failure)
+        if job.download_path and os.path.exists(job.download_path):
+            actual = os.path.getsize(job.download_path)
+            if actual > 0 and (job.file_size == 0 or actual == job.file_size):
+                log.info(f"File already on disk, skipping download: {job.download_path} ({actual} bytes)")
+                return job.download_path
+
         if job.telegram_channel_id and job.telegram_message_id:
             # Don't waste retries on a disconnected Telegram client
             if not telegram_service.is_ready:
