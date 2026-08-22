@@ -46,11 +46,14 @@ async def restart_worker(
     log.info(f"Worker restart requested: {body.worker} by {user.username}")
 
     if body.worker == "Telegram":
+        await telegram_monitor.stop()
         await telegram_service.disconnect()
+        import asyncio
+        await asyncio.sleep(1)
         await telegram_service.start()
         if telegram_service.is_ready:
             await telegram_monitor.start()
-        return {"success": True, "message": "Telegram worker restarted"}
+        return {"success": True, "message": f"Telegram restarted ({telegram_service.state})"}
 
     elif body.worker == "Queue" or body.worker == "Downloader":
         await queue_manager.stop()
@@ -78,12 +81,18 @@ async def restart_worker(
 async def emergency_reset(
     user: User = Depends(require_role(UserRole.admin)),
 ):
-    """Emergency reset — stop all workers, clean up, and restart."""
+    """Emergency reset — stop all workers, clean up, and restart everything."""
     log.critical(f"EMERGENCY RESET triggered by {user.username}")
 
     steps = []
 
-    # 1. Stop workers
+    # 1. Stop everything
+    try:
+        await telegram_monitor.stop()
+        steps.append("Telegram monitor stopped")
+    except Exception as e:
+        steps.append(f"Telegram monitor stop failed: {e}")
+
     try:
         await queue_manager.stop()
         steps.append("Queue stopped")
@@ -97,47 +106,62 @@ async def emergency_reset(
         steps.append(f"Checker stop failed: {e}")
 
     try:
-        await telegram_monitor.stop()
-        steps.append("Telegram monitor stopped")
+        await telegram_service.disconnect()
+        steps.append("Telegram disconnected")
     except Exception as e:
-        steps.append(f"Telegram monitor stop failed: {e}")
+        steps.append(f"Telegram disconnect failed: {e}")
 
-    # 2. Clean temp files
+    # 2. Clean temp + download files
     import shutil
-    from backend.config import TEMP_DIR
-    try:
-        for item in TEMP_DIR.iterdir():
-            if item.is_dir():
-                shutil.rmtree(item, ignore_errors=True)
-            else:
-                item.unlink(missing_ok=True)
-        steps.append("Temp files cleaned")
-    except Exception as e:
-        steps.append(f"Temp cleanup failed: {e}")
+    from backend.config import TEMP_DIR, DOWNLOAD_DIR
+    for label, d in [("Temp", TEMP_DIR), ("Downloads", DOWNLOAD_DIR)]:
+        try:
+            for item in d.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+            steps.append(f"{label} files cleaned")
+        except Exception as e:
+            steps.append(f"{label} cleanup failed: {e}")
 
-    # 3. Reset stuck jobs
-    from sqlalchemy import select, update
+    # 3. Reset ALL non-terminal jobs (stuck, in-progress, queued)
+    from sqlalchemy import select
     from backend.database import async_session
     from backend.models import Job, JobStatus
     try:
         async with async_session() as session:
             result = await session.execute(
                 select(Job).where(Job.status.in_([
-                    JobStatus.downloading, JobStatus.extracting,
+                    JobStatus.queued, JobStatus.downloading,
+                    JobStatus.downloaded, JobStatus.extracting,
                     JobStatus.checking, JobStatus.processing_results,
                     JobStatus.sending_discord, JobStatus.cleaning_up,
+                    JobStatus.waiting, JobStatus.paused,
                 ]))
             )
             stuck_jobs = result.scalars().all()
             for job in stuck_jobs:
                 job.status = JobStatus.failed
                 job.error_message = "Reset by emergency reset"
+                job.progress = 0.0
+                job.downloaded_bytes = 0
+                job.download_speed = 0
             await session.commit()
-            steps.append(f"Reset {len(stuck_jobs)} stuck job(s)")
+            steps.append(f"Reset {len(stuck_jobs)} job(s)")
     except Exception as e:
         steps.append(f"Job reset failed: {e}")
 
-    # 4. Restart workers
+    # 4. Restart everything
+    import asyncio
+    await asyncio.sleep(1)
+
+    try:
+        await telegram_service.start()
+        steps.append(f"Telegram reconnected ({telegram_service.state})")
+    except Exception as e:
+        steps.append(f"Telegram restart failed: {e}")
+
     try:
         await queue_manager.start()
         steps.append("Queue restarted")
@@ -150,6 +174,13 @@ async def emergency_reset(
             steps.append("Telegram monitor restarted")
         except Exception as e:
             steps.append(f"Telegram monitor restart failed: {e}")
+
+    try:
+        from backend.workers.watchdog import watchdog as wd
+        await wd.start()
+        steps.append("Watchdog restarted")
+    except Exception as e:
+        steps.append(f"Watchdog restart failed: {e}")
 
     log.info(f"Emergency reset complete: {'; '.join(steps)}")
     return {"success": True, "steps": steps}

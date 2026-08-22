@@ -201,11 +201,16 @@ function systemApp() {
         },
 
         async emergencyReset() {
-            if (await confirmAction('⚠ EMERGENCY RESET', 'This will stop all workers, clean temp files, reset stuck jobs, and restart everything. Permanent data will NOT be deleted.')) {
+            if (await confirmAction('⚠ EMERGENCY RESET', 'This will stop ALL workers, disconnect Telegram, clean temp + download files, reset ALL jobs, and restart everything from scratch.')) {
                 try {
+                    showToast('Resetting everything...', 'warning');
                     const res = await api('/api/workers/emergency-reset', { method: 'POST' });
-                    showToast('Emergency reset complete', 'warning');
-                    this.fetchStatus();
+                    if (res.steps) {
+                        res.steps.forEach(s => showToast(s, s.includes('failed') ? 'error' : 'success'));
+                    }
+                    showToast('Emergency reset complete', 'success');
+                    // Wait a moment then refresh status
+                    setTimeout(() => this.fetchStatus(), 2000);
                 } catch (e) {
                     showToast(`Reset failed: ${e.message}`, 'error');
                 }

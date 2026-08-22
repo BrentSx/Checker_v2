@@ -89,14 +89,18 @@
                 <div class="progress-fill" :style="`width: ${status.current_job?.progress || 0}%`"></div>
             </div>
         </div>
-        <div class="grid grid-cols-3 gap-4 mt-4" x-show="status.current_job?.status === 'downloading'">
+        <div class="grid grid-cols-4 gap-4 mt-4" x-show="status.current_job?.status === 'downloading'">
             <div>
                 <p class="text-xs text-gray-500">Downloaded</p>
                 <p class="text-sm font-bold text-white" x-text="formatBytes(status.current_job?.downloaded_bytes) + ' / ' + formatBytes(status.current_job?.file_size)"></p>
             </div>
             <div>
                 <p class="text-xs text-gray-500">Speed</p>
-                <p class="text-sm font-bold text-white" x-text="formatBytes(status.current_job?.download_speed) + '/s'"></p>
+                <p class="text-sm font-bold" :class="status.current_job?.download_speed > 0 ? 'text-green-400' : 'text-gray-500'" x-text="status.current_job?.download_speed > 0 ? formatBytes(status.current_job?.download_speed) + '/s' : 'starting...'"></p>
+            </div>
+            <div>
+                <p class="text-xs text-gray-500">ETA</p>
+                <p class="text-sm font-bold text-white" x-text="calcETA(status.current_job)"></p>
             </div>
             <div>
                 <p class="text-xs text-gray-500">Started</p>
@@ -196,8 +200,24 @@ function dashboardApp() {
             }, 3000);
 
             // WebSocket updates
-            ws.on('job_status', (data) => { this.fetchQueue(); });
-            ws.on('job_progress', (data) => { this.fetchQueue(); });
+            ws.on('job_status', (data) => { this.fetchStatus(); this.fetchQueue(); });
+            ws.on('job_progress', (data) => {
+                // Update current job progress in-place without refetching
+                if (this.status.current_job && this.status.current_job.id === data.job_id) {
+                    this.status.current_job.files_checked = data.files_checked;
+                    this.status.current_job.files_total = data.files_total;
+                    this.status.current_job.progress = data.progress;
+                }
+            });
+            ws.on('download_progress', (data) => {
+                // Update download progress + speed in-place (live)
+                if (this.status.current_job && this.status.current_job.id === data.job_id) {
+                    this.status.current_job.downloaded_bytes = data.downloaded;
+                    this.status.current_job.file_size = data.total;
+                    this.status.current_job.progress = data.progress;
+                    this.status.current_job.download_speed = data.speed || 0;
+                }
+            });
             ws.on('job_complete', (data) => {
                 this.fetchStatus();
                 this.fetchQueue();
@@ -209,7 +229,6 @@ function dashboardApp() {
                 showToast(`Job failed: ${data.error}`, 'error');
             });
             ws.on('health', (data) => {
-                // Update health in status
                 if (this.status.watchdog) {
                     this.status.watchdog.workers = data;
                 }
@@ -237,6 +256,14 @@ function dashboardApp() {
                 idle: 'gray', disabled: 'gray',
             };
             return map[state] || 'gray';
+        },
+
+        calcETA(job) {
+            if (!job || !job.download_speed || job.download_speed <= 0) return '—';
+            const remaining = (job.file_size || 0) - (job.downloaded_bytes || 0);
+            if (remaining <= 0) return 'done';
+            const secs = remaining / job.download_speed;
+            return formatDuration(secs);
         },
 
         formatBytes, formatDuration, formatNumber, timeAgo, statusBadge,

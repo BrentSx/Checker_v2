@@ -276,22 +276,32 @@ class QueueManager:
         os.makedirs(dest_dir, exist_ok=True)
 
         if job.telegram_channel_id and job.telegram_message_id:
-            # Download from Telegram
+            # Download from Telegram — track speed via byte deltas
+            dl_state = {"last_bytes": 0, "last_time": time.monotonic(), "speed": 0}
+
             async def progress(current, total):
-                pct = (current / total * 100) if total > 0 else 0
-                speed = 0  # TODO: calculate speed
-                await self._update_job(job.id, {
-                    "downloaded_bytes": current,
-                    "file_size": total,
-                    "progress": pct,
-                    "download_speed": speed,
-                })
-                await hub.broadcast("download_progress", {
-                    "job_id": job.id,
-                    "downloaded": current,
-                    "total": total,
-                    "progress": pct,
-                })
+                now = time.monotonic()
+                elapsed = now - dl_state["last_time"]
+                if elapsed >= 0.5:  # update speed every 500ms, don't spam DB
+                    delta = current - dl_state["last_bytes"]
+                    dl_state["speed"] = int(delta / elapsed) if elapsed > 0 else 0
+                    dl_state["last_bytes"] = current
+                    dl_state["last_time"] = now
+
+                    pct = (current / total * 100) if total > 0 else 0
+                    await self._update_job(job.id, {
+                        "downloaded_bytes": current,
+                        "file_size": total,
+                        "progress": pct,
+                        "download_speed": dl_state["speed"],
+                    })
+                    await hub.broadcast("download_progress", {
+                        "job_id": job.id,
+                        "downloaded": current,
+                        "total": total,
+                        "progress": pct,
+                        "speed": dl_state["speed"],
+                    })
 
             return await telegram_service.download_file(
                 job.telegram_channel_id,
@@ -326,17 +336,34 @@ class QueueManager:
                 dest_path = os.path.join(dest_dir, filename)
 
                 downloaded = 0
+                dl_state = {"last_bytes": 0, "last_time": time.monotonic(), "speed": 0}
                 with open(dest_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(64 * 1024):
                         f.write(chunk)
                         downloaded += len(chunk)
                         if total > 0:
-                            pct = downloaded / total * 100
-                            await self._update_job(job.id, {
-                                "downloaded_bytes": downloaded,
-                                "file_size": total,
-                                "progress": pct,
-                            })
+                            now = time.monotonic()
+                            elapsed = now - dl_state["last_time"]
+                            if elapsed >= 0.5:
+                                delta = downloaded - dl_state["last_bytes"]
+                                dl_state["speed"] = int(delta / elapsed) if elapsed > 0 else 0
+                                dl_state["last_bytes"] = downloaded
+                                dl_state["last_time"] = now
+
+                                pct = downloaded / total * 100
+                                await self._update_job(job.id, {
+                                    "downloaded_bytes": downloaded,
+                                    "file_size": total,
+                                    "progress": pct,
+                                    "download_speed": dl_state["speed"],
+                                })
+                                await hub.broadcast("download_progress", {
+                                    "job_id": job.id,
+                                    "downloaded": downloaded,
+                                    "total": total,
+                                    "progress": pct,
+                                    "speed": dl_state["speed"],
+                                })
 
                 return dest_path
 

@@ -63,11 +63,15 @@
                             <td x-html="statusBadge(job.status)"></td>
                             <td class="text-gray-400 text-sm" x-text="formatBytes(job.file_size)"></td>
                             <td>
-                                <div class="flex items-center gap-2 min-w-[120px]">
-                                    <div class="progress-bar flex-1">
-                                        <div class="progress-fill" :style="`width: ${job.progress}%`"></div>
+                                <div class="min-w-[140px]">
+                                    <div class="flex items-center gap-2">
+                                        <div class="progress-bar flex-1">
+                                            <div class="progress-fill" :style="`width: ${job.progress}%`"></div>
+                                        </div>
+                                        <span class="text-xs text-gray-400 w-10 text-right" x-text="Math.round(job.progress) + '%'"></span>
                                     </div>
-                                    <span class="text-xs text-gray-400 w-10 text-right" x-text="Math.round(job.progress) + '%'"></span>
+                                    <p x-show="job.status === 'downloading' && job.download_speed > 0"
+                                       class="text-xs text-green-400 mt-1" x-text="formatBytes(job.download_speed) + '/s'"></p>
                                 </div>
                             </td>
                             <td class="text-gray-400 text-xs whitespace-nowrap" x-text="timeAgo(job.created_at)"></td>
@@ -119,10 +123,26 @@ function queueApp() {
 
         async init() {
             await this.fetchQueue();
-            setInterval(() => this.fetchQueue(), 3000);
+            setInterval(() => this.fetchQueue(), 5000);
             ws.on('queue_update', () => this.fetchQueue());
             ws.on('job_status', () => this.fetchQueue());
-            ws.on('job_progress', () => this.fetchQueue());
+            ws.on('job_progress', (data) => {
+                const job = this.jobs.find(j => j.id === data.job_id);
+                if (job) {
+                    job.files_checked = data.files_checked;
+                    job.files_total = data.files_total;
+                    job.progress = data.progress;
+                }
+            });
+            ws.on('download_progress', (data) => {
+                const job = this.jobs.find(j => j.id === data.job_id);
+                if (job) {
+                    job.downloaded_bytes = data.downloaded;
+                    job.file_size = data.total;
+                    job.progress = data.progress;
+                    job.download_speed = data.speed || 0;
+                }
+            });
             ws.on('job_complete', () => this.fetchQueue());
         },
 
