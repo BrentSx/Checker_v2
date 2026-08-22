@@ -3,6 +3,7 @@
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import StaticPool
 
 from backend.config import DATABASE_URL
 
@@ -11,10 +12,10 @@ engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     future=True,
-    # SQLite only allows one writer — serialize all connections through one
-    pool_size=1,
-    max_overflow=0,
-    pool_pre_ping=True,
+    # Use StaticPool to serialize all writes through a single connection.
+    # NullPool (the aiosqlite default) doesn't accept pool_size/max_overflow,
+    # but StaticPool gives us one reusable connection — perfect for SQLite.
+    poolclass=StaticPool,
     connect_args={
         "timeout": 30,  # wait up to 30s for the lock instead of failing instantly
     },
