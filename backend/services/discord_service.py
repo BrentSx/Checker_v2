@@ -106,41 +106,73 @@ class DiscordService:
         return await self.send_message("", embeds=[embed])
 
     async def send_file(self, file_data: bytes, filename: str, content: str = "") -> bool:
-        """Send a file to Discord. Splits if larger than DISCORD_MAX_FILE_SIZE_MB (default 8)."""
+        """Send a file to Discord. Splits if larger than MAX_FILE_BYTES (default 8 MB).
+
+        If a part still gets rejected with 413, halves the chunk size and retries.
+        """
         if not self._webhook_url:
             log.warning("Discord webhook not configured")
             return False
 
         if len(file_data) <= MAX_FILE_BYTES:
-            return await self._upload_file(file_data, filename, content)
-
-        # Split into parts
-        num_parts = math.ceil(len(file_data) / MAX_FILE_BYTES)
-        log.info(f"Large file detected ({len(file_data)} bytes). Splitting into {num_parts} parts.")
-
-        await self.send_message(
-            f"📦 **Large result detected**\n"
-            f"Original: `{filename}` — {len(file_data) / (1024*1024):.1f} MB\n"
-            f"Sending: {num_parts} part(s)"
-        )
-
-        for i in range(num_parts):
-            start = i * MAX_FILE_BYTES
-            end = min(start + MAX_FILE_BYTES, len(file_data))
-            part_data = file_data[start:end]
-            part_name = f"{Path(filename).stem}.part{i+1:03d}"
-            part_content = f"Part {i+1}/{num_parts}"
-
-            ok = await self._upload_file(part_data, part_name, part_content)
-            if not ok:
-                log.error(f"Failed to send part {i+1}/{num_parts}")
+            ok = await self._upload_file(file_data, filename, content)
+            if ok:
+                return True
+            # If the single-chunk upload got 413, fall through to splitting
+            if self._last_error and "413" in self._last_error:
+                log.warning("Single-file upload got 413, will split smaller...")
+            else:
                 return False
 
-            # Rate limiting between parts
-            if i < num_parts - 1:
-                await asyncio.sleep(1)
+        # Try progressively smaller chunk sizes until it works
+        chunk_size = MAX_FILE_BYTES
+        MIN_CHUNK = 2 * 1024 * 1024  # 2 MB floor
 
-        return True
+        while chunk_size >= MIN_CHUNK:
+            num_parts = math.ceil(len(file_data) / chunk_size)
+            log.info(
+                f"Splitting {len(file_data)} bytes into {num_parts} part(s) "
+                f"at {chunk_size / (1024*1024):.0f} MB each"
+            )
+
+            await self.send_message(
+                f"📦 **Large result detected**\n"
+                f"Original: `{filename}` — {len(file_data) / (1024*1024):.1f} MB\n"
+                f"Sending: {num_parts} part(s) ({chunk_size / (1024*1024):.0f} MB each)"
+            )
+
+            all_ok = True
+            for i in range(num_parts):
+                start = i * chunk_size
+                end = min(start + chunk_size, len(file_data))
+                part_data = file_data[start:end]
+                part_name = f"{Path(filename).stem}.part{i+1:03d}"
+                part_content = f"Part {i+1}/{num_parts}"
+
+                ok = await self._upload_file(part_data, part_name, part_content)
+                if not ok:
+                    if self._last_error and "413" in self._last_error:
+                        # Still too big — halve and retry from scratch
+                        chunk_size //= 2
+                        log.warning(
+                            f"Part {i+1} still too large, reducing to "
+                            f"{chunk_size / (1024*1024):.0f} MB chunks..."
+                        )
+                        all_ok = False
+                        break
+                    # Non-413 failure — give up
+                    log.error(f"Failed to send part {i+1}/{num_parts}")
+                    return False
+
+                # Rate limiting between parts
+                if i < num_parts - 1:
+                    await asyncio.sleep(1)
+
+            if all_ok:
+                return True
+
+        log.error(f"Cannot send {filename}: still rejected at {MIN_CHUNK/(1024*1024):.0f} MB chunks")
+        return False
 
     async def _upload_file(self, data: bytes, filename: str, content: str = "") -> bool:
         """Upload a single file to Discord webhook."""

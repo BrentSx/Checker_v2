@@ -134,8 +134,11 @@ class Watchdog:
         dc = self._workers["Discord"]
         ds = discord_service.status()
         if ds["configured"]:
-            if ds["last_error"]:
-                dc.mark_unhealthy(ds["last_error"])
+            last_err = ds["last_error"] or ""
+            # 413 = "file too large" — not a connectivity problem, don't treat
+            # it as unhealthy (the webhook itself works fine).
+            if last_err and "413" not in last_err:
+                dc.mark_unhealthy(last_err)
             else:
                 dc.mark_healthy()
         else:
@@ -179,21 +182,21 @@ class Watchdog:
     async def _auto_restart(self, name: str, health: WorkerHealth):
         """Attempt to auto-restart a failed worker.
 
-        Caps at 5 auto-restarts per worker. After that, logs a warning and
-        stops retrying until the worker is manually restarted or a restart
+        Caps at 5 auto-restarts per worker. After that, logs a warning once
+        and stops retrying until the worker is manually restarted or a restart
         clears the counter.
         """
         MAX_AUTO_RESTARTS = 5
 
         if health.restart_count >= MAX_AUTO_RESTARTS:
-            # Only log once when we first hit the cap, not every 15 seconds
+            # Log once when we first hit the threshold, then stay silent
             if health.consecutive_failures == self._max_consecutive_failures:
                 log.error(
                     f"{name} has hit {MAX_AUTO_RESTARTS} auto-restart cap. "
                     f"Not retrying — fix the issue and restart manually."
                 )
-            # Reset failures so we don't spam this branch every check cycle
-            health.consecutive_failures = 0
+            # Do NOT reset consecutive_failures — let it keep climbing so this
+            # branch only logs once (when it exactly equals _max_consecutive_failures).
             return
 
         log.warning(f"{name} has {health.consecutive_failures} consecutive failures. Attempting restart...")
