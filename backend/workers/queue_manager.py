@@ -281,8 +281,11 @@ class QueueManager:
             log_j.info(f"Job completed in {_format_duration(total_time)}")
             await hub.broadcast("job_complete", {"job_id": job.id, "filename": job.filename})
 
-            # Update statistics
-            await self._update_stats(job, checker_result, total_time)
+            # Update statistics — wrapped so a stats error can't un-complete the job
+            try:
+                await self._update_stats(job, checker_result, total_time)
+            except Exception as stats_err:
+                log_j.warning(f"Stats update failed (job still completed): {stats_err}")
 
         except Exception as e:
             log_j.error(f"Job failed: {e}")
@@ -504,11 +507,11 @@ class QueueManager:
                 stat = Statistic(date=today)
                 session.add(stat)
 
-            stat.jobs_completed += 1
-            stat.files_checked += result.total
-            stat.data_downloaded_bytes += job.file_size or 0
-            stat.total_processing_seconds += elapsed
-            stat.discord_messages_sent += 1 if job.discord_sent else 0
+            stat.jobs_completed = (stat.jobs_completed or 0) + 1
+            stat.files_checked = (stat.files_checked or 0) + result.total
+            stat.data_downloaded_bytes = (stat.data_downloaded_bytes or 0) + (job.file_size or 0)
+            stat.total_processing_seconds = (stat.total_processing_seconds or 0) + elapsed
+            stat.discord_messages_sent = (stat.discord_messages_sent or 0) + (1 if job.discord_sent else 0)
             await session.commit()
 
     # ── Public job management ───────────────────────────────────────────────
