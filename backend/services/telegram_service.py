@@ -380,8 +380,15 @@ class TelegramService:
                         file_name = attr.file_name
                         break
                 file_size = msg.document.size or 0
+                # Capture the full message text (including hidden URLs)
+                text = msg.text or ""
+                if msg.entities:
+                    from telethon.tl.types import MessageEntityTextUrl
+                    for ent in msg.entities:
+                        if isinstance(ent, MessageEntityTextUrl) and ent.url:
+                            text += " " + ent.url
                 log.info(f"New file in channel {event.chat_id}: {file_name} ({file_size} bytes)")
-                await on_new_file(event.chat_id, msg.id, file_name, file_size)
+                await on_new_file(event.chat_id, msg.id, file_name, file_size, text)
 
         log.info(f"Monitoring {len(resolved)} channel(s) for new files")
 

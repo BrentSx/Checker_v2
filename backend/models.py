@@ -101,6 +101,9 @@ class Job(Base):
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     max_retries: Mapped[int] = mapped_column(Integer, default=3)
 
+    # Archive password (extracted from Telegram message text)
+    archive_password: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
     # Flags
     discord_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     cleanup_done: Mapped[bool] = mapped_column(Boolean, default=False)

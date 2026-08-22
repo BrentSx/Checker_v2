@@ -98,6 +98,7 @@ class QueueManager:
         telegram_channel_id: int | None = None,
         telegram_message_id: int | None = None,
         source_url: str | None = None,
+        archive_password: str | None = None,
     ) -> str:
         """Add a new job to the queue. Returns the job ID."""
         async with async_session() as session:
@@ -115,13 +116,15 @@ class QueueManager:
                 telegram_channel_id=telegram_channel_id,
                 telegram_message_id=telegram_message_id,
                 source_url=source_url,
+                archive_password=archive_password,
                 max_retries=MAX_RETRIES,
             )
             session.add(job)
             await session.commit()
             await session.refresh(job)
 
-            log.info(f"Job added: {filename} (ID: {job.id[:8]})")
+            pw_note = " (with password)" if archive_password else ""
+            log.info(f"Job added: {filename}{pw_note} (ID: {job.id[:8]})")
             await hub.broadcast("queue_update", {"action": "added", "job_id": job.id, "filename": filename})
             return job.id
 
@@ -196,11 +199,16 @@ class QueueManager:
                 "downloaded_bytes": actual_size,
             })
 
-            # 3. Extract
+            # 3. Extract (pass archive password if one was found in the message)
             await self._update_status(job.id, JobStatus.extracting)
-            log_j.info(f"Extracting: {job.filename}")
+            # Re-fetch the job to get archive_password (the initial object may be detached)
+            archive_password = await self._get_job_password(job.id)
+            if archive_password:
+                log_j.info(f"Extracting with password: {job.filename}")
+            else:
+                log_j.info(f"Extracting: {job.filename}")
             extract_dir = str(TEMP_DIR / f"job_{job.id[:8]}")
-            files_extracted = await extract_archive(download_path, extract_dir)
+            files_extracted = await extract_archive(download_path, extract_dir, password=archive_password)
             log_j.info(f"Extracted {files_extracted} files")
             await self._update_job(job.id, {
                 "extract_dir": extract_dir,
@@ -451,6 +459,12 @@ class QueueManager:
                         shutil.rmtree(db_job.extract_dir, ignore_errors=True)
                 except Exception:
                     pass
+
+    async def _get_job_password(self, job_id: str) -> Optional[str]:
+        """Fetch the archive_password for a job from the DB."""
+        async with async_session() as session:
+            result = await session.execute(select(Job.archive_password).where(Job.id == job_id))
+            return result.scalar_one_or_none()
 
     async def _update_status(self, job_id: str, status: JobStatus):
         """Update just the job status."""

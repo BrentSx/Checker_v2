@@ -1,6 +1,7 @@
 """Telegram channel monitor — watches for new files and adds them to the queue."""
 
 import asyncio
+import re
 from typing import Optional
 
 from sqlalchemy import select
@@ -13,6 +14,42 @@ from backend.services.telegram_service import telegram_service
 from backend.workers.queue_manager import queue_manager
 
 log = ComponentLogger("TelegramMonitor")
+
+# ── Password extraction from message text ──────────────────────────────────
+
+# Patterns ordered from most specific to least.
+# Each captures the actual password in group 1.
+_PASSWORD_PATTERNS = [
+    # "Password: xyz", "pass: xyz", "pw: xyz", "pwd: xyz" (with optional colon/equals)
+    re.compile(
+        r"(?:pass(?:word|wd|code)?|pw|пароль)\s*[:=\-–—]\s*(\S+)",
+        re.IGNORECASE,
+    ),
+    # "password is xyz", "pass is xyz"
+    re.compile(
+        r"(?:pass(?:word)?|pw)\s+is\s+(\S+)",
+        re.IGNORECASE,
+    ),
+    # Emoji key followed by the password: "🔑 xyz" / "🔐 xyz"
+    re.compile(r"[🔑🔐🔓🗝️]\s*(\S+)"),
+]
+
+
+def _extract_password(text: str) -> Optional[str]:
+    """Try to pull an archive password out of a Telegram message.
+
+    Returns the password string or None if nothing matched.
+    """
+    if not text:
+        return None
+
+    for pattern in _PASSWORD_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            pw = m.group(1).strip().strip("`'\"")
+            if pw:
+                return pw
+    return None
 
 
 class TelegramMonitor:
@@ -109,12 +146,18 @@ class TelegramMonitor:
 
                     self._processed_messages.add(key)
 
+                    # Try to extract an archive password from the message text
+                    password = _extract_password(msg.get("text", ""))
+                    if password:
+                        log.info(f"Startup scan found password in message for {fname}")
+
                     log.info(f"Startup scan found: {fname} ({msg.get('file_size', 0)} bytes)")
                     await queue_manager.add_job(
                         filename=fname,
                         file_size=msg.get("file_size", 0),
                         telegram_channel_id=channel_id,
                         telegram_message_id=msg["id"],
+                        archive_password=password,
                     )
                     # Only queue the latest one per channel
                     break
@@ -134,7 +177,8 @@ class TelegramMonitor:
             return result.scalar_one_or_none() is not None
 
     async def _on_new_file(
-        self, channel_id: int, message_id: int, filename: str, file_size: int
+        self, channel_id: int, message_id: int, filename: str, file_size: int,
+        message_text: str = "",
     ):
         """Called when a new file is detected in a monitored channel."""
         key = (channel_id, message_id)
@@ -148,6 +192,11 @@ class TelegramMonitor:
             log.info(f"Skipping non-archive file: {filename}")
             return
 
+        # Try to extract an archive password from the message text
+        password = _extract_password(message_text)
+        if password:
+            log.info(f"Found password in message for {filename}")
+
         log.info(f"New file detected: {filename} ({file_size} bytes)")
 
         await queue_manager.add_job(
@@ -155,6 +204,7 @@ class TelegramMonitor:
             file_size=file_size,
             telegram_channel_id=channel_id,
             telegram_message_id=message_id,
+            archive_password=password,
         )
 
 
