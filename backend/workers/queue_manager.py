@@ -37,7 +37,8 @@ class QueueManager:
         self._running = False
         self._paused = False
         self._current_job: Optional[Job] = None
-        self._task: Optional[asyncio.Task] = None
+        self._current_task: Optional[asyncio.Task] = None  # the job processing task
+        self._task: Optional[asyncio.Task] = None  # the loop task
         self._download_progress = {}
 
     @property
@@ -141,14 +142,23 @@ class QueueManager:
                     continue
 
                 self._current_job = job
-                await self._process_job(job)
-                self._current_job = None
+                # Run the job in its own task so we can cancel it
+                self._current_task = asyncio.create_task(self._process_job(job))
+                try:
+                    await self._current_task
+                except asyncio.CancelledError:
+                    log.warning(f"Job {job.id[:8]} was cancelled")
+                    await self._handle_cancel(job)
+                finally:
+                    self._current_job = None
+                    self._current_task = None
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 log.error(f"Queue loop error: {e}")
                 self._current_job = None
+                self._current_task = None
                 await asyncio.sleep(5)
 
     async def _get_next_job(self) -> Optional[Job]:
@@ -487,14 +497,51 @@ class QueueManager:
                 log.info(f"Job {job_id[:8]} re-queued for retry")
 
     async def cancel_job(self, job_id: str):
-        """Cancel a queued job."""
+        """Cancel a queued OR in-progress job."""
+        # If it's the currently running job, cancel the task
+        if self._current_job and self._current_job.id == job_id:
+            log.info(f"Cancelling active job {job_id[:8]}...")
+            # Tell Telegram to stop downloading
+            telegram_service.cancel_download()
+            # Cancel the processing task
+            if self._current_task and not self._current_task.done():
+                self._current_task.cancel()
+            return
+
+        # Otherwise cancel it in the DB (queued/waiting)
         async with async_session() as session:
             result = await session.execute(select(Job).where(Job.id == job_id))
             job = result.scalar_one_or_none()
-            if job and job.status == JobStatus.queued:
+            if job and job.status in (JobStatus.queued, JobStatus.waiting, JobStatus.paused):
                 job.status = JobStatus.cancelled
                 await session.commit()
                 log.info(f"Job {job_id[:8]} cancelled")
+                await hub.broadcast("job_status", {"job_id": job_id, "status": "cancelled"})
+
+    async def _handle_cancel(self, job: Job):
+        """Clean up after a cancelled job."""
+        async with async_session() as session:
+            result = await session.execute(select(Job).where(Job.id == job.id))
+            db_job = result.scalar_one_or_none()
+            if db_job:
+                db_job.status = JobStatus.cancelled
+                db_job.error_message = "Cancelled by user"
+                db_job.progress = 0.0
+                db_job.download_speed = 0
+                await session.commit()
+
+        # Clean up any partial files
+        try:
+            if job.download_path and os.path.exists(job.download_path):
+                os.remove(job.download_path)
+            extract_dir = str(TEMP_DIR / f"job_{job.id[:8]}")
+            if os.path.exists(extract_dir):
+                shutil.rmtree(extract_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+        await hub.broadcast("job_status", {"job_id": job.id, "status": "cancelled"})
+        log.info(f"Job {job.id[:8]} cancelled and cleaned up")
 
     async def clear_completed(self):
         """Remove completed jobs from the list."""

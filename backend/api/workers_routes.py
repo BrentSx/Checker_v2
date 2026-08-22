@@ -243,22 +243,6 @@ async def get_telegram_channels(user: User = Depends(get_current_user)):
     return await telegram_service.get_channels()
 
 
-class FastDownloadToggle(BaseModel):
-    enabled: bool
-
-
-@router.post("/telegram/fast-download")
-async def toggle_fast_download(
-    body: FastDownloadToggle,
-    user: User = Depends(require_role(UserRole.admin)),
-):
-    """Toggle fast (parallel) download mode."""
-    telegram_service.fast_download = body.enabled
-    mode = "⚡ Fast" if body.enabled else "🐢 Slow"
-    log.info(f"Download mode set to {mode} by {user.username}")
-    return {"success": True, "fast_download": body.enabled}
-
-
 @router.get("/telegram/messages")
 async def get_telegram_messages(
     channel_id: int,

@@ -80,7 +80,7 @@
                                     {% if user.role in ['admin', 'operator'] %}
                                     <button x-show="job.status === 'failed'"
                                             @click="retryJob(job.id)" class="btn btn-sm btn-success" title="Retry">↻</button>
-                                    <button x-show="job.status === 'queued'"
+                                    <button x-show="!['completed','failed','cancelled'].includes(job.status)"
                                             @click="cancelJob(job.id)" class="btn btn-sm btn-danger" title="Cancel">✕</button>
                                     {% endif %}
                                 </div>
@@ -172,10 +172,19 @@ function queueApp() {
         },
 
         async cancelJob(id) {
-            if (await confirmAction('Cancel Job', 'Are you sure you want to cancel this job?')) {
-                await api(`/api/queue/cancel/${id}`, { method: 'POST' });
-                showToast('Job cancelled', 'info');
-                this.fetchQueue();
+            const job = this.jobs.find(j => j.id === id);
+            const isActive = job && !['queued','completed','failed','cancelled'].includes(job.status);
+            const msg = isActive
+                ? 'This will stop the current download/check and cancel the job.'
+                : 'This will remove the job from the queue.';
+            if (await confirmAction('Cancel Job', msg)) {
+                try {
+                    await api(`/api/queue/cancel/${id}`, { method: 'POST' });
+                    showToast('Job cancelled', 'info');
+                    this.fetchQueue();
+                } catch (e) {
+                    showToast(`Cancel failed: ${e.message}`, 'error');
+                }
             }
         },
 

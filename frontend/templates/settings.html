@@ -56,24 +56,6 @@
             </div>
         </div>
 
-        <!-- Fast Download Toggle -->
-        <div class="mb-4 p-4 bg-dark-200 rounded-lg border border-dark-300">
-            <div class="flex items-center justify-between">
-                <div>
-                    <p class="text-sm font-bold text-white">⚡ Fast Download</p>
-                    <p class="text-xs text-gray-400 mt-1">Parallel chunk downloads — up to 32 workers scaled by file size</p>
-                </div>
-                <button @click="toggleFastDownload()"
-                        class="relative inline-flex h-7 w-12 items-center rounded-full transition-colors"
-                        :class="fastDownload ? 'bg-accent' : 'bg-dark-400'">
-                    <span class="inline-block h-5 w-5 rounded-full bg-white transition-transform"
-                          :class="fastDownload ? 'translate-x-6' : 'translate-x-1'"></span>
-                </button>
-            </div>
-            <p class="text-xs mt-2" :class="fastDownload ? 'text-green-400' : 'text-yellow-400'"
-               x-text="fastDownload ? '⚡ Parallel mode — max speed' : '🐢 Single connection — slower but safer'"></p>
-        </div>
-
         <!-- Config Fields -->
         <div class="space-y-4 max-w-lg">
             <div>
@@ -222,7 +204,6 @@ function settingsApp() {
         tgCode: '',
         tg2fa: '',
         tgPollInterval: null,
-        fastDownload: true,
 
         async init() {
             try {
@@ -238,9 +219,6 @@ function settingsApp() {
                 const status = await api('/api/workers/telegram/status');
                 this.tgState = status.state || 'idle';
                 this.tgError = status.error || '';
-                if (status.fast_download !== undefined) {
-                    this.fastDownload = status.fast_download;
-                }
                 // Poll while waiting for code/2fa
                 if (this.tgState === 'wait_code' || this.tgState === 'wait_2fa' || this.tgState === 'connecting') {
                     if (!this.tgPollInterval) {
@@ -253,20 +231,6 @@ function settingsApp() {
                     }
                 }
             } catch (e) {}
-        },
-
-        async toggleFastDownload() {
-            this.fastDownload = !this.fastDownload;
-            try {
-                await api('/api/workers/telegram/fast-download', {
-                    method: 'POST',
-                    body: JSON.stringify({ enabled: this.fastDownload }),
-                });
-                showToast(this.fastDownload ? '⚡ Fast download ON' : '🐢 Slow download ON', 'info');
-            } catch (e) {
-                this.fastDownload = !this.fastDownload; // revert
-                showToast(`Toggle failed: ${e.message}`, 'error');
-            }
         },
 
         async saveSettings(section) {

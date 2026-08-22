@@ -4,7 +4,7 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable
 from datetime import datetime, timezone
 
 from backend.config import (
@@ -14,28 +14,6 @@ from backend.config import (
 from backend.logging_config import ComponentLogger
 
 log = ComponentLogger("Telegram")
-
-# ── Parallel download constants (mirrors Go checker) ─────────────────────────
-
-CHUNK_SIZE = 1024 * 1024  # 1 MB — MTProto maximum
-MAX_RETRIES = 8
-RETRY_DELAYS = [0, 0.25, 0.5, 1, 2, 3, 5, 10]  # seconds
-DC_CONNECTIONS = 8  # parallel connections per DC (Go uses 8)
-
-
-def _best_workers(file_size: int) -> int:
-    """Return parallel worker count scaled by file size (matches Go checker)."""
-    if file_size < 1 << 20:       # < 1 MB
-        return 1
-    if file_size < 5 << 20:       # < 5 MB
-        return 2
-    if file_size < 20 << 20:      # < 20 MB
-        return 4
-    if file_size < 50 << 20:      # < 50 MB
-        return 8
-    if file_size < 500 << 20:     # < 500 MB
-        return 16
-    return 32
 
 
 def _format_size(n: int) -> str:
@@ -64,10 +42,7 @@ class TelegramService:
         self._on_new_file: Optional[Callable] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._dialogs_loaded = False
-        self.fast_download = True  # parallel mode on by default
-
-        # Connection pool for parallel downloads (like Go's dcPools)
-        self._dc_senders: dict[int, list] = {}
+        self._cancel_event: Optional[asyncio.Event] = None  # set to cancel download
 
     @property
     def state(self) -> str:
@@ -92,8 +67,12 @@ class TelegramService:
             "user": self._user_info,
             "configured": bool(TELEGRAM_API_ID and TELEGRAM_API_HASH),
             "channels": TELEGRAM_CHANNEL_IDS,
-            "fast_download": self.fast_download,
         }
+
+    def cancel_download(self):
+        """Signal the current download to stop."""
+        if self._cancel_event:
+            self._cancel_event.set()
 
     async def start(self, api_id: int = 0, api_hash: str = "", phone: str = ""):
         try:
@@ -118,7 +97,6 @@ class TelegramService:
         self._state = "connecting"
         self._error = ""
         self._dialogs_loaded = False
-        self._dc_senders = {}
         log.info("Connecting to Telegram...")
 
         try:
@@ -293,44 +271,7 @@ class TelegramService:
             log.error(f"Failed to get messages from channel {channel_id}: {e}")
             return []
 
-    # ── DC connection pool (mirrors Go's dcPools / MediaOnly) ────────────────
-
-    async def _get_dc_senders(self, dc_id: int, count: int) -> list:
-        """Get or create a pool of senders to a specific DC.
-
-        This mirrors the Go checker's filePoolAPI / MediaOnly — it creates
-        multiple persistent connections to the DC that hosts the file so
-        chunks can be downloaded in true parallel, not serialised over one
-        connection.
-        """
-        if dc_id in self._dc_senders and len(self._dc_senders[dc_id]) >= count:
-            return self._dc_senders[dc_id][:count]
-
-        from telethon import TelegramClient
-
-        senders = self._dc_senders.get(dc_id, [])
-
-        # Reuse the main client as one of the senders
-        if not senders:
-            senders.append(self._client)
-
-        # Create additional clients sharing the same session for parallel connections
-        need = count - len(senders)
-        if need > 0:
-            log.info(f"Creating {need} extra connection(s) to DC{dc_id}...")
-            for _ in range(need):
-                try:
-                    sender = await self._client._borrow_exported_sender(dc_id)
-                    senders.append(sender)
-                except Exception as e:
-                    log.warning(f"Failed to create DC{dc_id} sender: {e}")
-                    break
-
-        self._dc_senders[dc_id] = senders
-        log.info(f"DC{dc_id} pool: {len(senders)} connection(s)")
-        return senders
-
-    # ── Download methods ─────────────────────────────────────────────────────
+    # ── Download ─────────────────────────────────────────────────────────────
 
     async def download_file(
         self,
@@ -339,8 +280,16 @@ class TelegramService:
         dest_dir: str,
         progress_callback: Optional[Callable] = None,
     ) -> Optional[str]:
+        """Download a file from a Telegram message.
+
+        Uses Telethon's download_media which handles DC routing, chunking,
+        and retries internally.  tgcrypto speeds up the crypto layer.
+        """
         if not self._client or not self._authenticated:
             raise RuntimeError("Telegram not connected")
+
+        # Set up cancel event for this download
+        self._cancel_event = asyncio.Event()
 
         try:
             entity = await self._resolve_entity(channel_id)
@@ -358,153 +307,43 @@ class TelegramService:
             dest_path = os.path.join(dest_dir, file_name)
             file_size = msg.document.size or 0
 
-            if self.fast_download and file_size > 0:
-                workers = _best_workers(file_size)
-                log.info(f"⚡ Fast downloading {file_name} ({_format_size(file_size)}) "
-                         f"— {workers} workers, DC{msg.document.dc_id}")
-                await self._download_parallel(
-                    msg.document, dest_path, file_size, progress_callback
-                )
-            else:
-                log.info(f"🐢 Downloading {file_name} ({_format_size(file_size)})")
-                await self._client.download_media(
-                    msg, file=dest_path, progress_callback=progress_callback,
-                )
+            log.info(f"Downloading {file_name} ({_format_size(file_size)})")
+            start_time = time.monotonic()
 
-            log.info(f"Download complete: {file_name}")
+            # Wrap progress to check for cancellation
+            async def checked_progress(current, total):
+                if self._cancel_event and self._cancel_event.is_set():
+                    raise asyncio.CancelledError("Download cancelled by user")
+                if progress_callback:
+                    await progress_callback(current, total)
+
+            await self._client.download_media(
+                msg,
+                file=dest_path,
+                progress_callback=checked_progress,
+            )
+
+            elapsed = time.monotonic() - start_time
+            speed = file_size / elapsed if elapsed > 0 else 0
+            log.info(f"Download complete: {file_name} — "
+                     f"{_format_size(file_size)} in {elapsed:.1f}s "
+                     f"({_format_size(int(speed))}/s)")
             return dest_path
 
+        except asyncio.CancelledError:
+            log.warning(f"Download cancelled")
+            # Clean up partial file
+            if 'dest_path' in locals() and os.path.exists(dest_path):
+                try:
+                    os.remove(dest_path)
+                except OSError:
+                    pass
+            raise
         except Exception as e:
             log.error(f"Download failed: {e}")
             raise
-
-    async def _download_parallel(
-        self,
-        document,
-        dest_path: str,
-        file_size: int,
-        progress_callback: Optional[Callable] = None,
-    ):
-        """Parallel chunk download over multiple DC connections.
-
-        Mirrors Go checker:
-        - Creates a pool of connections to the file's DC
-        - Splits into 1 MB chunks
-        - Downloads with N workers across the connection pool
-        - Retries transient failures with backoff
-        """
-        from telethon.tl.functions.upload import GetFileRequest
-        from telethon.tl.types import InputDocumentFileLocation
-
-        location = InputDocumentFileLocation(
-            id=document.id,
-            access_hash=document.access_hash,
-            file_reference=document.file_reference,
-            thumb_size="",
-        )
-
-        dc_id = document.dc_id
-        num_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
-        workers = _best_workers(file_size)
-
-        # Build a connection pool to the file's DC (like Go's MediaOnly)
-        senders = await self._get_dc_senders(dc_id, min(workers, DC_CONNECTIONS))
-        sender_count = len(senders)
-
-        # Pre-allocate the file
-        with open(dest_path, "wb") as f:
-            f.truncate(file_size)
-
-        downloaded = 0
-        download_lock = asyncio.Lock()
-        start_time = time.monotonic()
-        first_error = None
-        error_lock = asyncio.Lock()
-
-        request = GetFileRequest(
-            location=location,
-            offset=0,
-            limit=CHUNK_SIZE,
-            precise=True,
-            cdn_supported=False,
-        )
-
-        async def fetch_chunk(chunk_idx: int):
-            nonlocal downloaded, first_error
-            offset = chunk_idx * CHUNK_SIZE
-
-            # Round-robin across the sender pool
-            sender = senders[chunk_idx % sender_count]
-
-            for attempt in range(MAX_RETRIES):
-                async with error_lock:
-                    if first_error is not None:
-                        return
-
-                if attempt > 0 and attempt < len(RETRY_DELAYS):
-                    await asyncio.sleep(RETRY_DELAYS[attempt])
-
-                try:
-                    # Build a fresh request with the correct offset
-                    req = GetFileRequest(
-                        location=location,
-                        offset=offset,
-                        limit=CHUNK_SIZE,
-                        precise=True,
-                        cdn_supported=False,
-                    )
-
-                    # Send through the pooled sender
-                    if sender is self._client:
-                        result = await self._client(req)
-                    else:
-                        result = await sender.send(req)
-
-                    data = result.bytes
-                    if not data:
-                        return
-
-                    # Write at the correct offset
-                    def _write():
-                        with open(dest_path, "r+b") as f:
-                            f.seek(offset)
-                            f.write(data)
-
-                    await asyncio.get_event_loop().run_in_executor(None, _write)
-
-                    async with download_lock:
-                        downloaded += len(data)
-                        if progress_callback:
-                            try:
-                                await progress_callback(downloaded, file_size)
-                            except Exception:
-                                pass
-                    return
-
-                except Exception as e:
-                    if attempt == MAX_RETRIES - 1:
-                        async with error_lock:
-                            if first_error is None:
-                                first_error = e
-                        return
-
-        # Run chunks with bounded concurrency
-        semaphore = asyncio.Semaphore(workers)
-
-        async def bounded_fetch(idx: int):
-            async with semaphore:
-                await fetch_chunk(idx)
-
-        tasks = [bounded_fetch(i) for i in range(num_chunks)]
-        await asyncio.gather(*tasks)
-
-        if first_error is not None:
-            raise first_error
-
-        elapsed = time.monotonic() - start_time
-        speed = file_size / elapsed if elapsed > 0 else 0
-        log.info(f"⚡ {_format_size(file_size)} in {elapsed:.1f}s "
-                 f"({_format_size(int(speed))}/s) — {sender_count} connections, {workers} workers")
+        finally:
+            self._cancel_event = None
 
     # ── Channel monitoring ───────────────────────────────────────────────────
 
@@ -547,17 +386,11 @@ class TelegramService:
         log.info(f"Monitoring {len(resolved)} channel(s) for new files")
 
     async def disconnect(self):
+        # Cancel any active download
+        if self._cancel_event:
+            self._cancel_event.set()
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
-        # Close DC pool senders
-        for dc_id, senders in self._dc_senders.items():
-            for s in senders:
-                if s is not self._client:
-                    try:
-                        await s.disconnect()
-                    except Exception:
-                        pass
-        self._dc_senders = {}
         if self._client:
             try:
                 await self._client.disconnect()
