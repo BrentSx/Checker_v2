@@ -16,6 +16,7 @@ python-jose[cryptography]==3.3.0
 
 # Telegram
 telethon==1.38.1
+tgcrypto==1.2.5
 
 # HTTP client for Discord/downloads
 aiohttp==3.11.12

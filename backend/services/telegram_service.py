@@ -20,6 +20,7 @@ log = ComponentLogger("Telegram")
 CHUNK_SIZE = 1024 * 1024  # 1 MB — MTProto maximum
 MAX_RETRIES = 8
 RETRY_DELAYS = [0, 0.25, 0.5, 1, 2, 3, 5, 10]  # seconds
+DC_CONNECTIONS = 8  # parallel connections per DC (Go uses 8)
 
 
 def _best_workers(file_size: int) -> int:
@@ -37,6 +38,16 @@ def _best_workers(file_size: int) -> int:
     return 32
 
 
+def _format_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    return f"{n / (1024 * 1024 * 1024):.2f} GB"
+
+
 class TelegramService:
     """Manages the Telegram client connection and file monitoring."""
 
@@ -44,7 +55,7 @@ class TelegramService:
         self._client = None
         self._connected = False
         self._authenticated = False
-        self._state = "idle"  # idle, connecting, wait_code, wait_2fa, ready, error
+        self._state = "idle"
         self._error = ""
         self._user_info = None
         self._session_file = str(DATA_DIR / "telegram_session")
@@ -53,7 +64,10 @@ class TelegramService:
         self._on_new_file: Optional[Callable] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._dialogs_loaded = False
-        self.fast_download = True  # Default to fast mode
+        self.fast_download = True  # parallel mode on by default
+
+        # Connection pool for parallel downloads (like Go's dcPools)
+        self._dc_senders: dict[int, list] = {}
 
     @property
     def state(self) -> str:
@@ -82,7 +96,6 @@ class TelegramService:
         }
 
     async def start(self, api_id: int = 0, api_hash: str = "", phone: str = ""):
-        """Start the Telegram client and authenticate."""
         try:
             from telethon import TelegramClient
             from telethon.errors import SessionPasswordNeededError
@@ -105,6 +118,7 @@ class TelegramService:
         self._state = "connecting"
         self._error = ""
         self._dialogs_loaded = False
+        self._dc_senders = {}
         log.info("Connecting to Telegram...")
 
         try:
@@ -176,7 +190,7 @@ class TelegramService:
             self._2fa_future.set_result(password)
 
     async def _ensure_dialogs_loaded(self):
-        """Fetch dialogs once to populate Telethon's entity cache (mirrors Go GetChannels)."""
+        """Fetch dialogs once to populate Telethon's entity cache."""
         if self._dialogs_loaded or not self._client or not self._authenticated:
             return
         try:
@@ -208,7 +222,6 @@ class TelegramService:
             return []
 
     async def _resolve_entity(self, channel_id: int):
-        """Resolve a channel ID to a Telethon entity. Loads dialogs first."""
         await self._ensure_dialogs_loaded()
         from telethon.tl.types import PeerChannel, PeerChat
 
@@ -280,6 +293,43 @@ class TelegramService:
             log.error(f"Failed to get messages from channel {channel_id}: {e}")
             return []
 
+    # ── DC connection pool (mirrors Go's dcPools / MediaOnly) ────────────────
+
+    async def _get_dc_senders(self, dc_id: int, count: int) -> list:
+        """Get or create a pool of senders to a specific DC.
+
+        This mirrors the Go checker's filePoolAPI / MediaOnly — it creates
+        multiple persistent connections to the DC that hosts the file so
+        chunks can be downloaded in true parallel, not serialised over one
+        connection.
+        """
+        if dc_id in self._dc_senders and len(self._dc_senders[dc_id]) >= count:
+            return self._dc_senders[dc_id][:count]
+
+        from telethon import TelegramClient
+
+        senders = self._dc_senders.get(dc_id, [])
+
+        # Reuse the main client as one of the senders
+        if not senders:
+            senders.append(self._client)
+
+        # Create additional clients sharing the same session for parallel connections
+        need = count - len(senders)
+        if need > 0:
+            log.info(f"Creating {need} extra connection(s) to DC{dc_id}...")
+            for _ in range(need):
+                try:
+                    sender = await self._client._borrow_exported_sender(dc_id)
+                    senders.append(sender)
+                except Exception as e:
+                    log.warning(f"Failed to create DC{dc_id} sender: {e}")
+                    break
+
+        self._dc_senders[dc_id] = senders
+        log.info(f"DC{dc_id} pool: {len(senders)} connection(s)")
+        return senders
+
     # ── Download methods ─────────────────────────────────────────────────────
 
     async def download_file(
@@ -289,7 +339,6 @@ class TelegramService:
         dest_dir: str,
         progress_callback: Optional[Callable] = None,
     ) -> Optional[str]:
-        """Download a file from a Telegram message. Uses fast or slow mode."""
         if not self._client or not self._authenticated:
             raise RuntimeError("Telegram not connected")
 
@@ -310,13 +359,14 @@ class TelegramService:
             file_size = msg.document.size or 0
 
             if self.fast_download and file_size > 0:
+                workers = _best_workers(file_size)
                 log.info(f"⚡ Fast downloading {file_name} ({_format_size(file_size)}) "
-                         f"with {_best_workers(file_size)} workers")
+                         f"— {workers} workers, DC{msg.document.dc_id}")
                 await self._download_parallel(
                     msg.document, dest_path, file_size, progress_callback
                 )
             else:
-                log.info(f"Downloading {file_name} ({_format_size(file_size)})")
+                log.info(f"🐢 Downloading {file_name} ({_format_size(file_size)})")
                 await self._client.download_media(
                     msg, file=dest_path, progress_callback=progress_callback,
                 )
@@ -335,10 +385,13 @@ class TelegramService:
         file_size: int,
         progress_callback: Optional[Callable] = None,
     ):
-        """Parallel chunk download — mirrors Go checker's approach.
+        """Parallel chunk download over multiple DC connections.
 
-        Splits the file into 1 MB chunks, downloads them concurrently with
-        worker count scaled by file size, retries transient failures.
+        Mirrors Go checker:
+        - Creates a pool of connections to the file's DC
+        - Splits into 1 MB chunks
+        - Downloads with N workers across the connection pool
+        - Retries transient failures with backoff
         """
         from telethon.tl.functions.upload import GetFileRequest
         from telethon.tl.types import InputDocumentFileLocation
@@ -350,8 +403,13 @@ class TelegramService:
             thumb_size="",
         )
 
+        dc_id = document.dc_id
         num_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
         workers = _best_workers(file_size)
+
+        # Build a connection pool to the file's DC (like Go's MediaOnly)
+        senders = await self._get_dc_senders(dc_id, min(workers, DC_CONNECTIONS))
+        sender_count = len(senders)
 
         # Pre-allocate the file
         with open(dest_path, "wb") as f:
@@ -363,12 +421,22 @@ class TelegramService:
         first_error = None
         error_lock = asyncio.Lock()
 
+        request = GetFileRequest(
+            location=location,
+            offset=0,
+            limit=CHUNK_SIZE,
+            precise=True,
+            cdn_supported=False,
+        )
+
         async def fetch_chunk(chunk_idx: int):
             nonlocal downloaded, first_error
             offset = chunk_idx * CHUNK_SIZE
 
+            # Round-robin across the sender pool
+            sender = senders[chunk_idx % sender_count]
+
             for attempt in range(MAX_RETRIES):
-                # Bail if another chunk already failed
                 async with error_lock:
                     if first_error is not None:
                         return
@@ -377,19 +445,26 @@ class TelegramService:
                     await asyncio.sleep(RETRY_DELAYS[attempt])
 
                 try:
-                    result = await self._client(GetFileRequest(
+                    # Build a fresh request with the correct offset
+                    req = GetFileRequest(
                         location=location,
                         offset=offset,
                         limit=CHUNK_SIZE,
                         precise=True,
                         cdn_supported=False,
-                    ))
+                    )
+
+                    # Send through the pooled sender
+                    if sender is self._client:
+                        result = await self._client(req)
+                    else:
+                        result = await sender.send(req)
 
                     data = result.bytes
                     if not data:
                         return
 
-                    # Write at the correct offset (file I/O in executor to not block)
+                    # Write at the correct offset
                     def _write():
                         with open(dest_path, "r+b") as f:
                             f.seek(offset)
@@ -428,8 +503,8 @@ class TelegramService:
 
         elapsed = time.monotonic() - start_time
         speed = file_size / elapsed if elapsed > 0 else 0
-        log.info(f"Parallel download finished: {_format_size(file_size)} in "
-                 f"{elapsed:.1f}s ({_format_size(int(speed))}/s)")
+        log.info(f"⚡ {_format_size(file_size)} in {elapsed:.1f}s "
+                 f"({_format_size(int(speed))}/s) — {sender_count} connections, {workers} workers")
 
     # ── Channel monitoring ───────────────────────────────────────────────────
 
@@ -474,6 +549,15 @@ class TelegramService:
     async def disconnect(self):
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
+        # Close DC pool senders
+        for dc_id, senders in self._dc_senders.items():
+            for s in senders:
+                if s is not self._client:
+                    try:
+                        await s.disconnect()
+                    except Exception:
+                        pass
+        self._dc_senders = {}
         if self._client:
             try:
                 await self._client.disconnect()
@@ -485,17 +569,6 @@ class TelegramService:
         self._user_info = None
         self._dialogs_loaded = False
         log.info("Telegram disconnected")
-
-
-def _format_size(n: int) -> str:
-    """Human-readable file size."""
-    if n < 1024:
-        return f"{n} B"
-    if n < 1024 * 1024:
-        return f"{n / 1024:.1f} KB"
-    if n < 1024 * 1024 * 1024:
-        return f"{n / (1024 * 1024):.1f} MB"
-    return f"{n / (1024 * 1024 * 1024):.2f} GB"
 
 
 # Global singleton
