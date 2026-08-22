@@ -62,7 +62,7 @@ TELEGRAM_CHANNEL_IDS = [int(x) for x in _list("TELEGRAM_CHANNEL_IDS") if x.isdig
 # ── Discord ─────────────────────────────────────────────────────────────────
 
 DISCORD_WEBHOOK_URL = _get("DISCORD_WEBHOOK_URL")
-DISCORD_MAX_FILE_SIZE_MB = _int("DISCORD_MAX_FILE_SIZE_MB", 25)
+DISCORD_MAX_FILE_SIZE_MB = _int("DISCORD_MAX_FILE_SIZE_MB", 8)
 
 # ── Cloudflare ──────────────────────────────────────────────────────────────
 

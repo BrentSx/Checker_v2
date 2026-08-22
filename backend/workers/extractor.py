@@ -53,26 +53,84 @@ async def extract_archive(archive_path: str, dest_dir: str, password: Optional[s
 
 
 def _extract_zip(archive_path: str, dest_dir: str, password: Optional[str] = None) -> int:
-    """Extract a ZIP archive, optionally with a password."""
+    """Extract a ZIP archive, optionally with a password.
+
+    Falls back to CLI ``7z`` or ``unzip`` when Python's built-in zipfile
+    cannot handle the compression method (Deflate64, Zstandard, etc.).
+    """
     pwd_bytes = password.encode("utf-8") if password else None
     count = 0
-    with zipfile.ZipFile(archive_path, "r") as zf:
-        if pwd_bytes:
-            zf.setpassword(pwd_bytes)
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            # Sanitize path to prevent traversal
-            safe_path = _safe_path(info.filename)
-            if not safe_path:
-                continue
-            target = os.path.join(dest_dir, safe_path)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with zf.open(info, pwd=pwd_bytes) as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            count += 1
-    log.info(f"ZIP extracted: {count} files from {os.path.basename(archive_path)}")
-    return count
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            if pwd_bytes:
+                zf.setpassword(pwd_bytes)
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                safe_path = _safe_path(info.filename)
+                if not safe_path:
+                    continue
+                target = os.path.join(dest_dir, safe_path)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(info, pwd=pwd_bytes) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                count += 1
+        log.info(f"ZIP extracted: {count} files from {os.path.basename(archive_path)}")
+        return count
+    except NotImplementedError:
+        # Python's zipfile doesn't support this compression (Deflate64, Zstandard, etc.)
+        log.warning(
+            f"Python zipfile can't handle compression in {os.path.basename(archive_path)}, "
+            "falling back to CLI..."
+        )
+        return _extract_zip_cli(archive_path, dest_dir, password)
+
+
+def _extract_zip_cli(archive_path: str, dest_dir: str, password: Optional[str] = None) -> int:
+    """Extract a ZIP using CLI tools (7z first, then unzip)."""
+    import subprocess
+
+    basename = os.path.basename(archive_path)
+
+    # Try each CLI tool in preference order
+    for tool_cmd in _zip_cli_commands(archive_path, dest_dir, password):
+        tool_name = tool_cmd[0]
+        try:
+            result = subprocess.run(
+                tool_cmd, capture_output=True, text=True, timeout=600,
+            )
+            if result.returncode == 0:
+                count = sum(1 for _ in Path(dest_dir).rglob("*") if _.is_file())
+                log.info(f"ZIP ({tool_name}) extracted: {count} files from {basename}")
+                return count
+            else:
+                log.warning(f"{tool_name} failed (rc={result.returncode}): {result.stderr[:200]}")
+        except FileNotFoundError:
+            log.info(f"{tool_name} not found, trying next tool...")
+        except Exception as e:
+            log.warning(f"{tool_name} error: {e}")
+
+    raise RuntimeError(
+        f"No CLI tool could extract {basename}. "
+        "Install 7z or unzip on the server."
+    )
+
+
+def _zip_cli_commands(archive_path: str, dest_dir: str, password: Optional[str] = None):
+    """Yield CLI commands to try for ZIP extraction, in preference order."""
+    # 7z — handles Deflate64, LZMA, Zstandard, etc.
+    cmd_7z = ["7z", "x", f"-o{dest_dir}", "-y"]
+    if password:
+        cmd_7z.append(f"-p{password}")
+    cmd_7z.append(archive_path)
+    yield cmd_7z
+
+    # unzip — handles most standard ZIPs
+    cmd_unzip = ["unzip", "-o", "-q"]
+    if password:
+        cmd_unzip.extend(["-P", password])
+    cmd_unzip.extend([archive_path, "-d", dest_dir])
+    yield cmd_unzip
 
 
 def _extract_rar(archive_path: str, dest_dir: str, password: Optional[str] = None) -> int:

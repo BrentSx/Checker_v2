@@ -106,7 +106,7 @@ class DiscordService:
         return await self.send_message("", embeds=[embed])
 
     async def send_file(self, file_data: bytes, filename: str, content: str = "") -> bool:
-        """Send a file to Discord. Automatically splits if >50MB."""
+        """Send a file to Discord. Splits if larger than DISCORD_MAX_FILE_SIZE_MB (default 8)."""
         if not self._webhook_url:
             log.warning("Discord webhook not configured")
             return False
