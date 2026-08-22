@@ -173,13 +173,40 @@ class TelegramService:
             log.error(f"Failed to get channels: {e}")
             return []
 
+    async def _resolve_entity(self, channel_id: int):
+        """Resolve a channel/chat ID to a Telethon entity.
+        Handles -100 prefixed IDs for channels/megagroups."""
+        from telethon.tl.types import PeerChannel, PeerChat
+        try:
+            # Try as-is first
+            return await self._client.get_entity(channel_id)
+        except (ValueError, TypeError):
+            pass
+        # Try as a PeerChannel (strip -100 prefix if present)
+        cid = channel_id
+        if cid < 0:
+            cid_str = str(abs(cid))
+            if cid_str.startswith("100"):
+                cid = int(cid_str[3:])
+            else:
+                cid = abs(cid)
+        try:
+            return await self._client.get_entity(PeerChannel(cid))
+        except (ValueError, TypeError):
+            pass
+        # Last resort: try as regular chat
+        try:
+            return await self._client.get_entity(PeerChat(abs(channel_id)))
+        except (ValueError, TypeError):
+            raise ValueError(f"Could not resolve entity for ID {channel_id}")
+
     async def get_messages(self, channel_id: int, limit: int = 20) -> list[dict]:
         """Get recent messages with files from a channel."""
         if not self._client or not self._authenticated:
             return []
 
         try:
-            entity = await self._client.get_entity(channel_id)
+            entity = await self._resolve_entity(channel_id)
             messages = []
             async for msg in self._client.iter_messages(entity, limit=limit):
                 has_file = msg.document is not None or msg.media is not None
@@ -217,7 +244,7 @@ class TelegramService:
             raise RuntimeError("Telegram not connected")
 
         try:
-            entity = await self._client.get_entity(channel_id)
+            entity = await self._resolve_entity(channel_id)
             msg = await self._client.get_messages(entity, ids=message_id)
             if not msg or not msg.document:
                 raise ValueError("Message has no file attachment")
