@@ -251,3 +251,81 @@ async def get_telegram_messages(
 ):
     """Get messages from a Telegram channel."""
     return await telegram_service.get_messages(channel_id, limit)
+
+
+@router.get("/telegram/archives")
+async def get_telegram_archives(
+    user: User = Depends(get_current_user),
+):
+    """Get the last 50 archive files across all monitored channels."""
+    from backend.config import TELEGRAM_CHANNEL_IDS
+
+    if not telegram_service.is_ready:
+        raise HTTPException(status_code=503, detail="Telegram not connected")
+
+    ARCHIVE_EXTS = (".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz")
+    archives = []
+
+    for channel_id in TELEGRAM_CHANNEL_IDS:
+        try:
+            entity = await telegram_service._resolve_entity(channel_id)
+            channel_title = getattr(entity, "title", str(channel_id))
+            # Grab more messages so we find enough archives
+            messages = await telegram_service.get_messages(channel_id, limit=200)
+            for msg in messages:
+                if not msg.get("has_file") or not msg.get("file_name"):
+                    continue
+                fname = msg["file_name"]
+                if not any(fname.lower().endswith(ext) for ext in ARCHIVE_EXTS):
+                    continue
+                archives.append({
+                    **msg,
+                    "channel_id": channel_id,
+                    "channel_title": channel_title,
+                })
+        except Exception as e:
+            log.warning(f"Failed to fetch archives from channel {channel_id}: {e}")
+
+    # Sort newest first, take 50
+    archives.sort(key=lambda a: a.get("date", ""), reverse=True)
+    return archives[:50]
+
+
+class QueueArchiveRequest(BaseModel):
+    channel_id: int
+    message_id: int
+
+
+@router.post("/telegram/queue-archive")
+async def queue_archive(
+    body: QueueArchiveRequest,
+    user: User = Depends(require_role(UserRole.admin, UserRole.operator)),
+):
+    """Manually queue an archive file from a Telegram message."""
+    if not telegram_service.is_ready:
+        raise HTTPException(status_code=503, detail="Telegram not connected")
+
+    # Fetch the message to get file info
+    messages = await telegram_service.get_messages(body.channel_id, limit=200)
+    target = None
+    for msg in messages:
+        if msg["id"] == body.message_id:
+            target = msg
+            break
+
+    if not target or not target.get("has_file"):
+        raise HTTPException(status_code=404, detail="Message not found or has no file")
+
+    # Extract password from message text
+    from backend.workers.telegram_monitor import _extract_password
+    password = _extract_password(target.get("text", ""))
+
+    job_id = await queue_manager.add_job(
+        filename=target["file_name"],
+        file_size=target.get("file_size", 0),
+        telegram_channel_id=body.channel_id,
+        telegram_message_id=body.message_id,
+        archive_password=password,
+    )
+    pw_note = " (with password)" if password else ""
+    return {"success": True, "job_id": job_id, "filename": target["file_name"], "password_found": bool(password)}

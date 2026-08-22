@@ -185,6 +185,16 @@ async def queue_page(request: Request):
     })
 
 
+@app.get("/files", response_class=HTMLResponse)
+async def files_page(request: Request):
+    session = _is_authenticated(request)
+    if not session:
+        return RedirectResponse(url="/login", status_code=302)
+    return templates.TemplateResponse("files.html", {
+        "request": request, "user": session, "page": "files",
+    })
+
+
 @app.get("/logs", response_class=HTMLResponse)
 async def logs_page(request: Request):
     session = _is_authenticated(request)

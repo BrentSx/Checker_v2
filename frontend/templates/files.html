@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+{% block title %}Files — Snickerdoodle Checker{% endblock %}
+
+{% block content %}
+<div x-data="filesApp()" x-init="init()">
+    <div class="flex items-center justify-between mb-6">
+        <h2 class="text-2xl font-bold text-white">Telegram Files</h2>
+        <div class="flex gap-2">
+            <button @click="fetchArchives()" class="btn btn-sm btn-ghost" :disabled="loading">
+                <span x-show="!loading">↻ Refresh</span>
+                <span x-show="loading">Loading...</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- Error banner -->
+    <div x-show="error" class="card border-red-500/30 mb-6">
+        <div class="flex items-center gap-2 text-red-400">
+            <span class="text-lg">✗</span>
+            <span x-text="error"></span>
+        </div>
+    </div>
+
+    <!-- Stats -->
+    <div class="grid grid-cols-2 md:grid-cols-3 gap-4 mb-6">
+        <div class="card text-center">
+            <p class="stat-value" x-text="archives.length"></p>
+            <p class="stat-label">Archives Found</p>
+        </div>
+        <div class="card text-center">
+            <p class="stat-value text-blue-400" x-text="formatBytes(totalSize)"></p>
+            <p class="stat-label">Total Size</p>
+        </div>
+        <div class="card text-center">
+            <p class="stat-value text-green-400" x-text="channelCount"></p>
+            <p class="stat-label">Channels</p>
+        </div>
+    </div>
+
+    <!-- Files Table -->
+    <div class="card">
+        <!-- Search / Filter -->
+        <div class="flex flex-col md:flex-row gap-3 mb-4">
+            <div class="flex-1">
+                <input type="text" x-model="search" placeholder="Search filenames..."
+                       class="input w-full">
+            </div>
+            <select x-model="channelFilter" class="input w-full md:w-48">
+                <option value="">All Channels</option>
+                <template x-for="ch in channels" :key="ch.id">
+                    <option :value="ch.id" x-text="ch.title"></option>
+                </template>
+            </select>
+        </div>
+
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Filename</th>
+                        <th>Size</th>
+                        <th>Channel</th>
+                        <th>Date</th>
+                        <th>Password</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <template x-for="(file, i) in filteredArchives" :key="file.channel_id + '-' + file.id">
+                        <tr>
+                            <td class="text-gray-500" x-text="i + 1"></td>
+                            <td>
+                                <div class="max-w-[300px]">
+                                    <p class="font-medium text-white truncate" x-text="file.file_name"></p>
+                                    <p class="text-xs text-gray-500 truncate max-w-[280px]"
+                                       x-show="file.text && file.text.length > 0"
+                                       x-text="file.text.substring(0, 80) + (file.text.length > 80 ? '...' : '')"></p>
+                                </div>
+                            </td>
+                            <td class="text-gray-400 text-sm whitespace-nowrap" x-text="formatBytes(file.file_size)"></td>
+                            <td class="text-gray-400 text-sm whitespace-nowrap" x-text="file.channel_title"></td>
+                            <td class="text-gray-400 text-xs whitespace-nowrap" x-text="formatDate(file.date)"></td>
+                            <td>
+                                <span x-show="hasPassword(file.text)" class="badge badge-green">🔑 Yes</span>
+                                <span x-show="!hasPassword(file.text)" class="text-gray-600 text-xs">—</span>
+                            </td>
+                            <td>
+                                {% if user.role in ['admin', 'operator'] %}
+                                <button @click="queueFile(file)"
+                                        class="btn btn-sm btn-primary"
+                                        :disabled="file._queuing"
+                                        x-text="file._queued ? '✓ Queued' : file._queuing ? '...' : '+ Queue'">
+                                </button>
+                                {% endif %}
+                            </td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+        </div>
+        <p x-show="!loading && filteredArchives.length === 0" class="text-gray-600 text-center py-8">
+            <span x-show="archives.length === 0">No archive files found in monitored channels</span>
+            <span x-show="archives.length > 0">No files match your filter</span>
+        </p>
+        <p x-show="loading" class="text-gray-500 text-center py-8">Loading files from Telegram...</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function filesApp() {
+    return {
+        archives: [],
+        loading: false,
+        error: '',
+        search: '',
+        channelFilter: '',
+
+        get totalSize() {
+            return this.archives.reduce((sum, f) => sum + (f.file_size || 0), 0);
+        },
+
+        get channels() {
+            const seen = new Map();
+            for (const a of this.archives) {
+                if (!seen.has(a.channel_id)) {
+                    seen.set(a.channel_id, { id: a.channel_id, title: a.channel_title });
+                }
+            }
+            return [...seen.values()];
+        },
+
+        get channelCount() {
+            return this.channels.length;
+        },
+
+        get filteredArchives() {
+            let list = this.archives;
+            if (this.search) {
+                const q = this.search.toLowerCase();
+                list = list.filter(f => f.file_name.toLowerCase().includes(q));
+            }
+            if (this.channelFilter) {
+                const cid = parseInt(this.channelFilter);
+                list = list.filter(f => f.channel_id === cid);
+            }
+            return list;
+        },
+
+        async init() {
+            await this.fetchArchives();
+        },
+
+        async fetchArchives() {
+            this.loading = true;
+            this.error = '';
+            try {
+                const data = await api('/api/workers/telegram/archives');
+                // Add UI state flags to each file
+                this.archives = data.map(f => ({ ...f, _queuing: false, _queued: false }));
+            } catch (e) {
+                this.error = e.message || 'Failed to fetch archives';
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        async queueFile(file) {
+            file._queuing = true;
+            try {
+                const result = await api('/api/workers/telegram/queue-archive', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        channel_id: file.channel_id,
+                        message_id: file.id,
+                    }),
+                });
+                file._queued = true;
+                const pw = result.password_found ? ' (password detected)' : '';
+                showToast(`Queued: ${result.filename}${pw}`, 'success');
+            } catch (e) {
+                showToast(`Failed to queue: ${e.message}`, 'error');
+            } finally {
+                file._queuing = false;
+            }
+        },
+
+        hasPassword(text) {
+            if (!text) return false;
+            return /(?:pass(?:word|wd|code)?|pw|пароль)\s*[:=\-–—]\s*\S+/i.test(text)
+                || /(?:pass(?:word)?|pw)\s+is\s+\S+/i.test(text)
+                || /[🔑🔐🔓🗝️]\s*\S+/.test(text);
+        },
+
+        formatDate(iso) {
+            if (!iso) return '—';
+            const d = new Date(iso);
+            return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+                 + ' ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+        },
+
+        formatBytes,
+    };
+}
+</script>
+{% endblock %}
