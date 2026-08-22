@@ -404,16 +404,34 @@ class QueueManager:
 
                 return dest_path
 
+    async def _should_keep_downloads(self) -> bool:
+        """Check the keep_downloads setting from the DB."""
+        try:
+            from backend.models import Setting
+            async with async_session() as session:
+                result = await session.execute(
+                    select(Setting).where(Setting.key == "keep_downloads")
+                )
+                setting = result.scalar_one_or_none()
+                return setting is not None and setting.value == "true"
+        except Exception:
+            return False
+
     async def _cleanup(self, download_path: str, extract_dir: str):
         """Clean up temporary files after processing."""
-        # Remove downloaded archive
-        if download_path and os.path.exists(download_path):
-            try:
-                os.remove(download_path)
-            except OSError as e:
-                log.warning(f"Failed to remove download: {e}")
+        keep = await self._should_keep_downloads()
 
-        # Remove extracted files
+        # Remove downloaded archive (unless keep-downloads is on)
+        if download_path and os.path.exists(download_path):
+            if keep:
+                log.info(f"Keeping download (keep-downloads ON): {os.path.basename(download_path)}")
+            else:
+                try:
+                    os.remove(download_path)
+                except OSError as e:
+                    log.warning(f"Failed to remove download: {e}")
+
+        # Always remove extracted files (they're just unpacked temp copies)
         if extract_dir and os.path.exists(extract_dir):
             try:
                 shutil.rmtree(extract_dir, ignore_errors=True)

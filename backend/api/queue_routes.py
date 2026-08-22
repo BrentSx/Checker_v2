@@ -2,9 +2,11 @@
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import select
 from typing import Optional
 
-from backend.models import User, UserRole
+from backend.database import async_session
+from backend.models import User, UserRole, Setting
 from backend.api.auth_routes import get_current_user, require_role
 from backend.workers.queue_manager import queue_manager
 
@@ -86,3 +88,36 @@ async def clear_completed(
     """Clear all completed/cancelled jobs."""
     await queue_manager.clear_completed()
     return {"success": True}
+
+
+# ── Keep-downloads toggle ──────────────────────────────────────────────────
+
+@router.get("/keep-downloads")
+async def get_keep_downloads(user: User = Depends(get_current_user)):
+    """Get the current keep-downloads setting."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(Setting).where(Setting.key == "keep_downloads")
+        )
+        setting = result.scalar_one_or_none()
+        return {"enabled": setting.value == "true" if setting else False}
+
+
+@router.post("/keep-downloads")
+async def toggle_keep_downloads(
+    user: User = Depends(require_role(UserRole.admin, UserRole.operator)),
+):
+    """Toggle the keep-downloads setting."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(Setting).where(Setting.key == "keep_downloads")
+        )
+        setting = result.scalar_one_or_none()
+        if setting:
+            new_val = "false" if setting.value == "true" else "true"
+            setting.value = new_val
+        else:
+            new_val = "true"
+            session.add(Setting(key="keep_downloads", value=new_val))
+        await session.commit()
+        return {"enabled": new_val == "true"}

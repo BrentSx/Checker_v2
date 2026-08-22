@@ -5,8 +5,15 @@
 <div x-data="queueApp()" x-init="init()">
     <div class="flex items-center justify-between mb-6">
         <h2 class="text-2xl font-bold text-white">Queue</h2>
-        <div class="flex gap-2">
+        <div class="flex items-center gap-3">
             {% if user.role in ['admin', 'operator'] %}
+            <!-- Keep Downloads toggle -->
+            <button @click="toggleKeepDownloads()" class="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm transition-colors"
+                    :class="keepDownloads ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-dark-200 text-gray-500 border border-dark-300 hover:text-gray-300'"
+                    :title="keepDownloads ? 'Downloads kept on disk for fast retries' : 'Downloads deleted after processing'">
+                <span class="text-base" x-text="keepDownloads ? '💾' : '🗑️'"></span>
+                <span x-text="keepDownloads ? 'Keep Downloads' : 'Delete Downloads'"></span>
+            </button>
             <button @click="togglePause()" class="btn btn-sm" :class="paused ? 'btn-success' : 'btn-warning'">
                 <span x-text="paused ? '▶ Resume' : '⏸ Pause'"></span>
             </button>
@@ -119,10 +126,12 @@ function queueApp() {
     return {
         jobs: [],
         paused: false,
+        keepDownloads: false,
         stats: { queued: 0, active: 0, completed: 0, failed: 0 },
 
         async init() {
             await this.fetchQueue();
+            await this.fetchKeepDownloads();
             setInterval(() => this.fetchQueue(), 5000);
             ws.on('queue_update', () => this.fetchQueue());
             ws.on('job_status', () => this.fetchQueue());
@@ -192,6 +201,28 @@ function queueApp() {
             await api('/api/queue/clear-completed', { method: 'POST' });
             showToast('Completed jobs cleared', 'info');
             this.fetchQueue();
+        },
+
+        async fetchKeepDownloads() {
+            try {
+                const data = await api('/api/queue/keep-downloads');
+                this.keepDownloads = data.enabled;
+            } catch (e) {}
+        },
+
+        async toggleKeepDownloads() {
+            try {
+                const data = await api('/api/queue/keep-downloads', { method: 'POST' });
+                this.keepDownloads = data.enabled;
+                showToast(
+                    this.keepDownloads
+                        ? 'Keep Downloads ON — files stay on disk for fast retries'
+                        : 'Keep Downloads OFF — files deleted after processing',
+                    'info'
+                );
+            } catch (e) {
+                showToast(`Toggle failed: ${e.message}`, 'error');
+            }
         },
 
         formatBytes, formatDuration, formatNumber, timeAgo, statusBadge,
