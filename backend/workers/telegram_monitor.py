@@ -55,6 +55,9 @@ class TelegramMonitor:
     async def _monitor_loop(self, channel_ids: list[int]):
         """Polling-based channel monitor. Also registers event handler."""
         try:
+            # On startup, grab the latest archive from each channel
+            await self._startup_scan(channel_ids)
+
             # Register event handler for live updates
             await telegram_service.monitor_channels(
                 channel_ids, self._on_new_file
@@ -69,6 +72,40 @@ class TelegramMonitor:
         except Exception as e:
             log.error(f"Monitor error: {e}")
             self._running = False
+
+    async def _startup_scan(self, channel_ids: list[int]):
+        """On startup, find the latest archive file from monitored channels and queue it."""
+        log.info("Startup scan: looking for latest archive in monitored channels...")
+
+        ARCHIVE_EXTS = (".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz")
+
+        for channel_id in channel_ids:
+            try:
+                messages = await telegram_service.get_messages(channel_id, limit=20)
+                for msg in messages:
+                    if not msg.get("has_file") or not msg.get("file_name"):
+                        continue
+                    fname = msg["file_name"]
+                    if not any(fname.lower().endswith(ext) for ext in ARCHIVE_EXTS):
+                        continue
+
+                    key = (channel_id, msg["id"])
+                    if key in self._processed_messages:
+                        continue
+                    self._processed_messages.add(key)
+
+                    log.info(f"Startup scan found: {fname} ({msg.get('file_size', 0)} bytes)")
+                    await queue_manager.add_job(
+                        filename=fname,
+                        file_size=msg.get("file_size", 0),
+                        telegram_channel_id=channel_id,
+                        telegram_message_id=msg["id"],
+                    )
+                    # Only queue the latest one per channel
+                    break
+
+            except Exception as e:
+                log.warning(f"Startup scan failed for channel {channel_id}: {e}")
 
     async def _on_new_file(
         self, channel_id: int, message_id: int, filename: str, file_size: int
