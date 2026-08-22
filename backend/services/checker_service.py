@@ -171,12 +171,10 @@ class CheckerService:
     async def _run_builtin(
         self, extract_dir: str, job_id: str, progress_callback=None
     ) -> CheckerResult:
-        """Built-in scanner that counts and categorizes files.
+        """Built-in scanner — searches every .txt in every subfolder, every line.
 
-        This does NOT perform actual Microsoft/Minecraft authentication.
-        It scans the extracted directory for cookie/text files and produces
-        a file listing. For real checking, configure CHECKER_COMMAND to
-        point to the Go checker binary.
+        Looks for Microsoft/Minecraft cookie keywords on each line.
+        Any file with at least one matching line is flagged as a hit.
         """
         result = CheckerResult()
         log_j = log.with_job(job_id)
@@ -186,28 +184,42 @@ class CheckerService:
         result.results_dir = str(run_dir)
 
         extract_path = Path(extract_dir)
-        all_files = list(extract_path.rglob("*"))
-        file_list = [f for f in all_files if f.is_file()]
-        self._files_total = len(file_list)
-        result.total = len(file_list)
 
-        # Categorize files
-        txt_files = [f for f in file_list if f.suffix.lower() == ".txt"]
-        cookie_files = []
-        other_files = []
+        # Gather every .txt in every subfolder
+        txt_files = list(extract_path.rglob("*.txt"))
+        self._files_total = len(txt_files)
+        result.total = len(txt_files)
+
+        log_j.info(f"Scanning {len(txt_files)} .txt files across all subfolders...")
+
+        # Keywords to match (checked against every line, case-insensitive)
+        KEYWORDS = (
+            ".minecraft.net", "minecraft.net", "mojang",
+            "xbox", "xboxlive.com", "live.com",
+            "microsoftonline", "login.live.com",
+            "login.microsoftonline.com",
+            "sisu.xboxlive.com",
+        )
+
+        cookie_files = []   # files with at least one matching line
+        other_files = []     # .txt files with zero matches
+        matched_lines = []   # (filepath, line) tuples for the results file
 
         for f in txt_files:
+            found = False
             try:
-                content = f.read_text(errors="replace")[:1000]
-                # Simple cookie detection: look for common cookie fields
-                if any(keyword in content.lower() for keyword in [
-                    ".minecraft.net", "mojang", "xbox", "live.com",
-                    "microsoftonline", "xboxlive.com", "login.live.com",
-                ]):
-                    cookie_files.append(f)
-                else:
-                    other_files.append(f)
+                with open(f, "r", errors="replace") as fh:
+                    for line in fh:
+                        lower_line = line.lower()
+                        if any(kw in lower_line for kw in KEYWORDS):
+                            found = True
+                            matched_lines.append((str(f.relative_to(extract_path)), line.rstrip()))
             except Exception:
+                pass
+
+            if found:
+                cookie_files.append(f)
+            else:
                 other_files.append(f)
 
             self._files_processed += 1
@@ -219,30 +231,43 @@ class CheckerService:
 
         # Write summary
         summary_file = run_dir / "scan_summary.txt"
-        summary_file.write_text(
-            f"Scan Results\n"
-            f"============\n"
-            f"Total files: {result.total}\n"
-            f"Cookie files found: {len(cookie_files)}\n"
-            f"Other .txt files: {len(other_files)}\n"
-            f"Non-txt files: {len(file_list) - len(txt_files)}\n\n"
-            f"Cookie files:\n" +
-            "\n".join(f"  {f.name}" for f in cookie_files[:100])
-        )
+        summary_lines = [
+            f"Scan Results",
+            f"============",
+            f"Total .txt files scanned: {result.total}",
+            f"Files with MC cookies: {len(cookie_files)}",
+            f"Files without MC cookies: {len(other_files)}",
+            f"Total matching lines: {len(matched_lines)}",
+            f"",
+            f"Files with hits:",
+        ]
+        for f in cookie_files:
+            summary_lines.append(f"  {f.relative_to(extract_path)}")
+
+        summary_file.write_text("\n".join(summary_lines))
+
+        # Write all matched lines to a separate file
+        if matched_lines:
+            hits_file = run_dir / "matched_lines.txt"
+            with open(hits_file, "w", errors="replace") as out:
+                for filepath, line in matched_lines:
+                    out.write(f"{filepath}\t{line}\n")
 
         # Copy cookie files to results
         found_dir = run_dir / "found_cookies"
         found_dir.mkdir(exist_ok=True)
         for f in cookie_files:
             try:
-                shutil.copy2(f, found_dir / f.name)
+                dest = found_dir / f.relative_to(extract_path)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dest)
             except Exception:
                 pass
 
         log_j.info(
-            f"Scan complete: {result.total} files, "
-            f"{len(cookie_files)} cookies found "
-            f"(Note: configure CHECKER_COMMAND for full MC auth checking)"
+            f"Scan complete: {result.total} .txt files, "
+            f"{len(cookie_files)} with MC cookies, "
+            f"{len(matched_lines)} matching lines"
         )
 
         return result
