@@ -114,6 +114,15 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
                     sudo dnf install -y python3 python3-pip ;;
             esac
         done
+    elif check_command yum; then
+        PKG_MGR="yum"
+        for pkg in "${MISSING[@]}"; do
+            case "$pkg" in
+                python3|python3-pip|python3.10+)
+                    sudo yum install -y python3 python3-pip 2>/dev/null || true ;;
+            esac
+        done
+        sudo yum install -y unrar p7zip 2>/dev/null || true
     elif check_command pacman; then
         PKG_MGR="pacman"
         for pkg in "${MISSING[@]}"; do
@@ -123,7 +132,7 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
             esac
         done
     else
-        log_fail "No supported package manager found (apt, dnf, pacman)"
+        log_fail "No supported package manager found (apt, dnf, yum, pacman)"
         log_fail "Please install manually: ${MISSING[*]}"
         exit 1
     fi

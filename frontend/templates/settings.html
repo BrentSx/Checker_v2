@@ -19,6 +19,44 @@
     <!-- Telegram Settings -->
     <div x-show="activeTab === 'telegram'" class="card">
         <h3 class="text-lg font-bold text-white mb-4">Telegram Configuration</h3>
+
+        <!-- Status Banner -->
+        <div class="mb-4 p-3 rounded-lg border" x-show="tgState !== 'idle'"
+             :class="tgState === 'ready' ? 'bg-green-500/10 border-green-500/30' :
+                     tgState === 'error' ? 'bg-red-500/10 border-red-500/30' :
+                     'bg-yellow-500/10 border-yellow-500/30'">
+            <p class="text-sm font-semibold"
+               :class="tgState === 'ready' ? 'text-green-400' : tgState === 'error' ? 'text-red-400' : 'text-yellow-400'">
+                <span x-show="tgState === 'connecting'">⏳ Connecting to Telegram...</span>
+                <span x-show="tgState === 'wait_code'">📱 Verification code sent to your Telegram app</span>
+                <span x-show="tgState === 'wait_2fa'">🔒 Two-factor authentication required</span>
+                <span x-show="tgState === 'ready'">✅ Telegram connected</span>
+                <span x-show="tgState === 'error'" x-text="'❌ ' + (tgError || 'Connection failed')"></span>
+            </p>
+        </div>
+
+        <!-- Verification Code Input -->
+        <div x-show="tgState === 'wait_code'" class="mb-4 p-4 bg-dark-200 rounded-lg border border-yellow-500/30">
+            <label class="input-label">Enter Verification Code</label>
+            <div class="flex gap-2">
+                <input type="text" x-model="tgCode" class="input" placeholder="12345" maxlength="10" autofocus
+                       @keydown.enter="submitCode()">
+                <button @click="submitCode()" class="btn btn-primary">Submit</button>
+            </div>
+            <p class="text-xs text-gray-500 mt-2">Check your Telegram app for the code</p>
+        </div>
+
+        <!-- 2FA Password Input -->
+        <div x-show="tgState === 'wait_2fa'" class="mb-4 p-4 bg-dark-200 rounded-lg border border-yellow-500/30">
+            <label class="input-label">Enter 2FA Password</label>
+            <div class="flex gap-2">
+                <input type="password" x-model="tg2fa" class="input" placeholder="Your 2FA password"
+                       @keydown.enter="submit2fa()">
+                <button @click="submit2fa()" class="btn btn-primary">Submit</button>
+            </div>
+        </div>
+
+        <!-- Config Fields -->
         <div class="space-y-4 max-w-lg">
             <div>
                 <label class="input-label">API ID</label>
@@ -38,7 +76,8 @@
             </div>
             <div class="flex gap-2">
                 <button @click="saveSettings('telegram')" class="btn btn-primary">Save</button>
-                <button @click="testTelegram()" class="btn btn-ghost">Connect</button>
+                <button @click="testTelegram()" class="btn btn-ghost" x-text="tgState === 'ready' ? 'Reconnect' : 'Connect'"></button>
+                <button @click="disconnectTelegram()" class="btn btn-danger" x-show="tgState === 'ready'">Disconnect</button>
             </div>
         </div>
     </div>
@@ -160,6 +199,11 @@ function settingsApp() {
             { id: 'logging', label: 'Logging' },
         ],
         form: {},
+        tgState: 'idle',
+        tgError: '',
+        tgCode: '',
+        tg2fa: '',
+        tgPollInterval: null,
 
         async init() {
             try {
@@ -167,6 +211,26 @@ function settingsApp() {
             } catch (e) {
                 this.form = {};
             }
+            await this.fetchTgStatus();
+        },
+
+        async fetchTgStatus() {
+            try {
+                const status = await api('/api/workers/telegram/status');
+                this.tgState = status.state || 'idle';
+                this.tgError = status.error || '';
+                // Poll while waiting for code/2fa
+                if (this.tgState === 'wait_code' || this.tgState === 'wait_2fa' || this.tgState === 'connecting') {
+                    if (!this.tgPollInterval) {
+                        this.tgPollInterval = setInterval(() => this.fetchTgStatus(), 2000);
+                    }
+                } else {
+                    if (this.tgPollInterval) {
+                        clearInterval(this.tgPollInterval);
+                        this.tgPollInterval = null;
+                    }
+                }
+            } catch (e) {}
         },
 
         async saveSettings(section) {
@@ -183,7 +247,8 @@ function settingsApp() {
 
         async testTelegram() {
             try {
-                await api('/api/workers/telegram/start', {
+                this.tgState = 'connecting';
+                const result = await api('/api/workers/telegram/start', {
                     method: 'POST',
                     body: JSON.stringify({
                         api_id: parseInt(this.form.telegram_api_id) || 0,
@@ -191,9 +256,58 @@ function settingsApp() {
                         phone: this.form.telegram_phone || '',
                     }),
                 });
+                this.tgState = result.state || 'connecting';
+                this.tgError = result.error || '';
                 showToast('Telegram connection started', 'info');
+                // Start polling for state changes
+                if (!this.tgPollInterval) {
+                    this.tgPollInterval = setInterval(() => this.fetchTgStatus(), 2000);
+                }
             } catch (e) {
+                this.tgState = 'error';
+                this.tgError = e.message;
                 showToast(`Telegram error: ${e.message}`, 'error');
+            }
+        },
+
+        async submitCode() {
+            if (!this.tgCode.trim()) return;
+            try {
+                await api('/api/workers/telegram/code', {
+                    method: 'POST',
+                    body: JSON.stringify({ code: this.tgCode.trim() }),
+                });
+                this.tgCode = '';
+                showToast('Code submitted', 'info');
+                // Poll for result
+                setTimeout(() => this.fetchTgStatus(), 1500);
+            } catch (e) {
+                showToast(`Code error: ${e.message}`, 'error');
+            }
+        },
+
+        async submit2fa() {
+            if (!this.tg2fa) return;
+            try {
+                await api('/api/workers/telegram/2fa', {
+                    method: 'POST',
+                    body: JSON.stringify({ password: this.tg2fa }),
+                });
+                this.tg2fa = '';
+                showToast('2FA password submitted', 'info');
+                setTimeout(() => this.fetchTgStatus(), 1500);
+            } catch (e) {
+                showToast(`2FA error: ${e.message}`, 'error');
+            }
+        },
+
+        async disconnectTelegram() {
+            try {
+                await api('/api/workers/telegram/disconnect', { method: 'POST' });
+                this.tgState = 'idle';
+                showToast('Telegram disconnected', 'info');
+            } catch (e) {
+                showToast(`Disconnect error: ${e.message}`, 'error');
             }
         },
 
