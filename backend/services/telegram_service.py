@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional, Callable
@@ -14,6 +15,59 @@ from backend.config import (
 from backend.logging_config import ComponentLogger
 
 log = ComponentLogger("Telegram")
+
+
+def _doc_filename(document) -> str:
+    """Pull the file_name attribute off a Telethon document, or '' if absent."""
+    if not document:
+        return ""
+    for attr in document.attributes:
+        if hasattr(attr, "file_name") and attr.file_name:
+            return attr.file_name
+    return ""
+
+
+def _sibling_matcher(part1_filename: str) -> Optional[re.Pattern]:
+    """Build a regex matching every volume of a multi-part archive.
+
+    Given the *first* volume's filename, return a compiled pattern that matches
+    the whole set (including the first volume). Returns None when the file is a
+    single-volume archive that needs no siblings.
+
+    Handles the common multi-volume naming schemes:
+      * ``name.part01.rar`` .. ``name.partNN.rar``  (new-style RAR)
+      * ``name.rar`` + ``name.r00`` / ``name.r01``  (old-style RAR)
+      * ``name.7z.001`` .. ``name.7z.NNN``           (split 7z)
+      * ``name.zip.001`` .. ``name.zip.NNN``         (split zip)
+      * ``name.zip`` + ``name.z01`` / ``name.z02``   (spanned zip)
+    """
+    name = part1_filename
+
+    # new-style RAR: name.part1.rar / name.part01.rar
+    m = re.match(r"^(?P<base>.+)\.part0*1\.rar$", name, re.IGNORECASE)
+    if m:
+        base = re.escape(m.group("base"))
+        return re.compile(rf"^{base}\.part\d+\.rar$", re.IGNORECASE)
+
+    # split 7z / split zip: name.7z.001 / name.zip.001
+    m = re.match(r"^(?P<base>.+\.(?:7z|zip))\.0*1$", name, re.IGNORECASE)
+    if m:
+        base = re.escape(m.group("base"))
+        return re.compile(rf"^{base}\.\d+$", re.IGNORECASE)
+
+    # old-style RAR: first volume is name.rar, siblings are name.r00, name.r01, ...
+    m = re.match(r"^(?P<base>.+)\.rar$", name, re.IGNORECASE)
+    if m:
+        base = re.escape(m.group("base"))
+        return re.compile(rf"^{base}\.(?:rar|r\d+)$", re.IGNORECASE)
+
+    # spanned zip: first volume is name.zip, siblings are name.z01, name.z02, ...
+    m = re.match(r"^(?P<base>.+)\.zip$", name, re.IGNORECASE)
+    if m:
+        base = re.escape(m.group("base"))
+        return re.compile(rf"^{base}\.(?:zip|z\d+)$", re.IGNORECASE)
+
+    return None
 
 
 def _format_size(n: int) -> str:
@@ -341,6 +395,104 @@ class TelegramService:
             raise
         except Exception as e:
             log.error(f"Download failed: {e}")
+            raise
+        finally:
+            self._cancel_event = None
+
+    async def download_archive_volumes(
+        self,
+        channel_id: int,
+        part1_message_id: int,
+        part1_filename: str,
+        dest_dir: str,
+        progress_callback: Optional[Callable] = None,
+    ) -> list[str]:
+        """Download every *additional* volume of a multi-part archive.
+
+        A multi-volume RAR/7z/zip can only be extracted when all its volumes are
+        present on disk next to the first one. The monitor queues just the first
+        volume, so this fetches the siblings (part2..partN) into *dest_dir*.
+
+        Returns the list of sibling paths that are present after the call (both
+        freshly downloaded and already-on-disk ones). Returns an empty list when
+        the file is a single-volume archive with no siblings.
+        """
+        if not self._client or not self._authenticated:
+            raise RuntimeError("Telegram not connected")
+
+        matcher = _sibling_matcher(part1_filename)
+        if matcher is None:
+            return []
+
+        entity = await self._resolve_entity(channel_id)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        # Volumes are posted as consecutive messages, so a window around the
+        # first volume's message id is enough to find them all.
+        window = 500
+        min_id = max(0, part1_message_id - window)
+        max_id = part1_message_id + window
+
+        # Set up a cancel event so an in-progress volume can be aborted.
+        self._cancel_event = asyncio.Event()
+
+        siblings: list[str] = []
+        try:
+            candidates = []
+            async for msg in self._client.iter_messages(
+                entity, min_id=min_id, max_id=max_id
+            ):
+                if msg.id == part1_message_id or not msg.document:
+                    continue
+                fname = _doc_filename(msg.document)
+                if fname and matcher.match(fname):
+                    candidates.append(msg)
+
+            if not candidates:
+                return []
+
+            log.info(
+                f"Multi-volume archive '{part1_filename}': "
+                f"found {len(candidates)} sibling volume(s) to fetch"
+            )
+
+            async def checked_progress(current, total):
+                if self._cancel_event and self._cancel_event.is_set():
+                    raise asyncio.CancelledError("Download cancelled by user")
+                if progress_callback:
+                    await progress_callback(current, total)
+
+            for msg in sorted(candidates, key=lambda m: _doc_filename(m.document).lower()):
+                fname = _doc_filename(msg.document)
+                dest_path = os.path.join(dest_dir, fname)
+                expected = msg.document.size or 0
+
+                if (
+                    os.path.exists(dest_path)
+                    and expected > 0
+                    and os.path.getsize(dest_path) == expected
+                ):
+                    log.info(f"Volume already on disk, skipping: {fname}")
+                    siblings.append(dest_path)
+                    continue
+
+                log.info(f"Downloading volume {fname} ({_format_size(expected)})")
+                start_time = time.monotonic()
+                await self._client.download_media(
+                    msg, file=dest_path, progress_callback=checked_progress
+                )
+                elapsed = time.monotonic() - start_time
+                speed = expected / elapsed if elapsed > 0 else 0
+                log.info(
+                    f"Volume complete: {fname} — {_format_size(expected)} "
+                    f"in {elapsed:.1f}s ({_format_size(int(speed))}/s)"
+                )
+                siblings.append(dest_path)
+
+            return siblings
+
+        except Exception as e:
+            log.error(f"Volume download failed: {e}")
             raise
         finally:
             self._cancel_event = None

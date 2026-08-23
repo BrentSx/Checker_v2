@@ -20,7 +20,12 @@ from backend.logging_config import ComponentLogger
 
 log = ComponentLogger("Discord")
 
-MAX_FILE_BYTES = DISCORD_MAX_FILE_SIZE_MB * 1024 * 1024
+# Discord rejects webhook uploads whose *whole request* exceeds ~8 MiB on a
+# non-boosted server. Leaving headroom for multipart overhead, 7 MiB payloads
+# pass reliably on the first try. Clamp the configured value to this ceiling so
+# a too-high DISCORD_MAX_FILE_SIZE_MB can't cause repeated 413s.
+WEBHOOK_SAFE_BYTES = 7 * 1024 * 1024
+MAX_FILE_BYTES = min(DISCORD_MAX_FILE_SIZE_MB * 1024 * 1024, WEBHOOK_SAFE_BYTES)
 
 
 class DiscordService:
@@ -243,7 +248,7 @@ class DiscordService:
             footer="Snickerdoodle Checker",
         )
 
-        # Send results file if available
+        # Send the results zip (summary + matched lines — should be small)
         if ok and results_zip_data:
             zip_name = f"results_{job_id[:8]}.zip"
             ok = await self.send_file(results_zip_data, zip_name)

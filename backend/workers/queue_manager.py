@@ -22,7 +22,7 @@ from backend.database import async_session
 from backend.models import Job, JobStatus, Statistic
 from backend.logging_config import ComponentLogger
 from backend.websocket_hub import hub
-from backend.services.telegram_service import telegram_service
+from backend.services.telegram_service import telegram_service, _sibling_matcher
 from backend.services.discord_service import discord_service
 from backend.services.checker_service import checker_service
 from backend.workers.extractor import extract_archive
@@ -248,10 +248,12 @@ class QueueManager:
             elapsed = time.time() - start_time
             processing_time = _format_duration(elapsed)
 
-            # Create results zip if results directory exists
+            # Create a lightweight zip for Discord — summary + matched lines only.
+            # The full found_cookies/ directory stays on disk but is NOT uploaded
+            # (it can be hundreds of MB with thousands of files).
             results_zip_data = None
             if checker_result.results_dir and os.path.exists(checker_result.results_dir):
-                results_zip_data = _create_zip(checker_result.results_dir)
+                results_zip_data = _create_discord_zip(checker_result.results_dir)
 
             discord_ok = await discord_service.send_job_result(
                 filename=job.filename,
@@ -292,67 +294,91 @@ class QueueManager:
             await self._handle_failure(job, str(e))
 
     async def _download(self, job: Job) -> Optional[str]:
-        """Download the file for a job."""
+        """Download the file for a job.
+
+        For multi-volume archives (``.part1.rar`` etc.) this also fetches the
+        sibling volumes so extraction has every part on disk — done even when the
+        first volume is already present from a previous attempt.
+        """
         dest_dir = str(DOWNLOAD_DIR)
         os.makedirs(dest_dir, exist_ok=True)
 
-        # Skip re-download if the file already exists on disk (e.g. retry after extraction failure)
+        # Track download speed via byte deltas — reused for part1 and siblings.
+        dl_state = {"last_bytes": 0, "last_time": time.monotonic(), "speed": 0}
+
+        async def progress(current, total):
+            now = time.monotonic()
+            elapsed = now - dl_state["last_time"]
+            if elapsed >= 0.5:  # update speed every 500ms, don't spam DB
+                delta = current - dl_state["last_bytes"]
+                dl_state["speed"] = int(delta / elapsed) if elapsed > 0 else 0
+                dl_state["last_bytes"] = current
+                dl_state["last_time"] = now
+
+                pct = (current / total * 100) if total > 0 else 0
+                await self._update_job(job.id, {
+                    "downloaded_bytes": current,
+                    "file_size": total,
+                    "progress": pct,
+                    "download_speed": dl_state["speed"],
+                })
+                await hub.broadcast("download_progress", {
+                    "job_id": job.id,
+                    "downloaded": current,
+                    "total": total,
+                    "progress": pct,
+                    "speed": dl_state["speed"],
+                })
+
+        # ── Fetch the first volume ────────────────────────────────────────────
+        part1_path: Optional[str] = None
+
+        # Skip re-download if the file already exists on disk (e.g. retry after
+        # an extraction failure). Siblings are still ensured below.
         if job.download_path and os.path.exists(job.download_path):
             actual = os.path.getsize(job.download_path)
             if actual > 0 and (job.file_size == 0 or actual == job.file_size):
                 log.info(f"File already on disk, skipping download: {job.download_path} ({actual} bytes)")
-                return job.download_path
+                part1_path = job.download_path
 
-        if job.telegram_channel_id and job.telegram_message_id:
-            # Don't waste retries on a disconnected Telegram client
+        if part1_path is None:
+            if job.telegram_channel_id and job.telegram_message_id:
+                # Don't waste retries on a disconnected Telegram client
+                if not telegram_service.is_ready:
+                    raise RuntimeError(
+                        "Telegram is not connected — waiting for reconnection"
+                    )
+                part1_path = await telegram_service.download_file(
+                    job.telegram_channel_id,
+                    job.telegram_message_id,
+                    dest_dir,
+                    progress_callback=progress,
+                )
+            elif job.source_url:
+                # URL downloads can't resolve sibling volumes — return directly.
+                return await self._download_url(job, dest_dir)
+            else:
+                raise RuntimeError("No download source configured for this job")
+
+        # ── Fetch sibling volumes for multi-part archives ─────────────────────
+        if part1_path and job.telegram_channel_id and job.telegram_message_id:
             if not telegram_service.is_ready:
                 raise RuntimeError(
-                    "Telegram is not connected — waiting for reconnection"
+                    "Telegram is not connected — cannot fetch archive volumes"
                 )
-            # Download from Telegram — track speed via byte deltas
-            dl_state = {"last_bytes": 0, "last_time": time.monotonic(), "speed": 0}
-
-            async def progress(current, total):
-                now = time.monotonic()
-                elapsed = now - dl_state["last_time"]
-                if elapsed >= 0.5:  # update speed every 500ms, don't spam DB
-                    delta = current - dl_state["last_bytes"]
-                    dl_state["speed"] = int(delta / elapsed) if elapsed > 0 else 0
-                    dl_state["last_bytes"] = current
-                    dl_state["last_time"] = now
-
-                    pct = (current / total * 100) if total > 0 else 0
-                    await self._update_job(job.id, {
-                        "downloaded_bytes": current,
-                        "file_size": total,
-                        "progress": pct,
-                        "download_speed": dl_state["speed"],
-                    })
-                    await hub.broadcast("download_progress", {
-                        "job_id": job.id,
-                        "downloaded": current,
-                        "total": total,
-                        "progress": pct,
-                        "speed": dl_state["speed"],
-                    })
-
-            return await telegram_service.download_file(
+            siblings = await telegram_service.download_archive_volumes(
                 job.telegram_channel_id,
                 job.telegram_message_id,
+                os.path.basename(part1_path),
                 dest_dir,
                 progress_callback=progress,
             )
+            if siblings:
+                log.with_job(job.id).info(
+                    f"Fetched {len(siblings)} additional volume(s) for {job.filename}"
+                )
 
-        elif job.source_url:
-            # Download from URL
-            return await self._download_url(job, dest_dir)
-
-        elif job.download_path and os.path.exists(job.download_path):
-            # File already exists locally
-            return job.download_path
-
-        else:
-            raise RuntimeError("No download source configured for this job")
+        return part1_path
 
     async def _download_url(self, job: Job, dest_dir: str) -> str:
         """Download a file from a URL."""
@@ -421,15 +447,26 @@ class QueueManager:
         """Clean up temporary files after processing."""
         keep = await self._should_keep_downloads()
 
-        # Remove downloaded archive (unless keep-downloads is on)
+        # Remove downloaded archive + any sibling volumes (unless keep-downloads is on)
         if download_path and os.path.exists(download_path):
             if keep:
                 log.info(f"Keeping download (keep-downloads ON): {os.path.basename(download_path)}")
             else:
-                try:
-                    os.remove(download_path)
-                except OSError as e:
-                    log.warning(f"Failed to remove download: {e}")
+                targets = [download_path]
+                # For multi-volume archives, also remove the sibling volumes.
+                matcher = _sibling_matcher(os.path.basename(download_path))
+                if matcher is not None:
+                    folder = os.path.dirname(download_path)
+                    for name in os.listdir(folder):
+                        if matcher.match(name):
+                            sib = os.path.join(folder, name)
+                            if sib not in targets:
+                                targets.append(sib)
+                for target in targets:
+                    try:
+                        os.remove(target)
+                    except OSError as e:
+                        log.warning(f"Failed to remove download {os.path.basename(target)}: {e}")
 
         # Always remove extracted files (they're just unpacked temp copies)
         if extract_dir and os.path.exists(extract_dir):
@@ -646,7 +683,7 @@ class QueueManager:
 
             results_zip_data = None
             if checker_result.results_dir and os.path.exists(checker_result.results_dir):
-                results_zip_data = _create_zip(checker_result.results_dir)
+                results_zip_data = _create_discord_zip(checker_result.results_dir)
 
             discord_ok = await discord_service.send_job_result(
                 filename=job.filename,
@@ -797,15 +834,27 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h {mins}m {secs}s"
 
 
-def _create_zip(directory: str) -> bytes:
-    """Create a zip archive from a directory, returned as bytes."""
+def _create_discord_zip(directory: str) -> Optional[bytes]:
+    """Create a lightweight zip for Discord — summary + matched lines only.
+
+    The full ``found_cookies/`` directory (which can be hundreds of MB) is
+    intentionally excluded. Only the small text summaries are sent.
+    Returns None if no files to send.
+    """
+    base = Path(directory)
     buf = io.BytesIO()
+    count = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        base = Path(directory)
-        for f in base.rglob("*"):
-            if f.is_file():
-                zf.write(f, f.relative_to(base))
-    return buf.getvalue()
+        for name in ("scan_summary.txt", "matched_lines.txt"):
+            fpath = base / name
+            if fpath.exists():
+                zf.write(fpath, name)
+                count += 1
+    if count == 0:
+        return None
+    data = buf.getvalue()
+    log.info(f"Discord zip: {count} file(s), {len(data)} bytes")
+    return data
 
 
 # Global singleton
