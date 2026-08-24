@@ -136,7 +136,7 @@ class TelegramMonitor:
         for channel_id in channel_ids:
             try:
                 messages = await telegram_service.get_messages(channel_id, limit=50)
-                for msg in messages:
+                for idx, msg in enumerate(messages):
                     if not msg.get("has_file") or not msg.get("file_name"):
                         continue
                     fname = msg["file_name"]
@@ -159,10 +159,14 @@ class TelegramMonitor:
 
                     self._processed_messages.add(key)
 
-                    # Try to extract an archive password from the message text
+                    # Try to extract an archive password from the message text.
+                    # If the file message has no password, check the 2 messages
+                    # before and after it (passwords are often posted separately).
                     password = _extract_password(msg.get("text", ""))
+                    if not password:
+                        password = self._find_nearby_password(messages, idx)
                     if password:
-                        log.info(f"Startup scan found password in message for {fname}")
+                        log.info(f"Startup scan found password for {fname}")
 
                     log.info(f"Startup scan found: {fname} ({msg.get('file_size', 0)} bytes)")
                     await queue_manager.add_job(
@@ -181,6 +185,20 @@ class TelegramMonitor:
             log.info(f"Startup scan queued {queued_count} archive(s)")
         else:
             log.info("Startup scan: all archives already processed")
+
+    @staticmethod
+    def _find_nearby_password(messages: list[dict], file_idx: int) -> Optional[str]:
+        """Search the 2 messages before and after a file message for a password.
+
+        Passwords are often posted in a separate message adjacent to the file.
+        """
+        for offset in (-1, 1, -2, 2):
+            neighbor_idx = file_idx + offset
+            if 0 <= neighbor_idx < len(messages):
+                pw = _extract_password(messages[neighbor_idx].get("text", ""))
+                if pw:
+                    return pw
+        return None
 
     async def _job_exists(self, channel_id: int, message_id: int) -> bool:
         """Check if a job for this Telegram message already exists (any status)."""
@@ -203,10 +221,16 @@ class TelegramMonitor:
             return
         self._processed_messages.add(key)
 
+        # Cap the in-memory set so it doesn't grow without bound over weeks
+        if len(self._processed_messages) > 10000:
+            # Keep the most recent half (arbitrary trim — DB check below is the real guard)
+            excess = len(self._processed_messages) - 5000
+            for _ in range(excess):
+                self._processed_messages.pop()
+
         # Only process archive files
         lower = filename.lower()
         if not any(lower.endswith(ext) for ext in (".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz")):
-            log.info(f"Skipping non-archive file: {filename}")
             return
 
         # Skip non-first parts of multi-part RAR archives
@@ -214,10 +238,29 @@ class TelegramMonitor:
             log.info(f"Skipping multi-part RAR (not part1): {filename}")
             return
 
-        # Try to extract an archive password from the message text
+        # Check DB for duplicates — the in-memory set is empty after restart,
+        # so a live event for an already-queued file would slip through without this.
+        if await self._job_exists(channel_id, message_id):
+            log.info(f"Skipping {filename} (already in queue)")
+            return
+
+        # Try to extract an archive password from the message text.
+        # If not found, check the 2 messages before (the file message is newest,
+        # so the password was likely posted just before it).
         password = _extract_password(message_text)
+        if not password:
+            try:
+                nearby = await telegram_service.get_messages(channel_id, limit=5)
+                # Find the file message index in the nearby list
+                file_idx = next(
+                    (i for i, m in enumerate(nearby) if m["id"] == message_id), -1
+                )
+                if file_idx >= 0:
+                    password = self._find_nearby_password(nearby, file_idx)
+            except Exception:
+                pass
         if password:
-            log.info(f"Found password in message for {filename}")
+            log.info(f"Found password for {filename}")
 
         log.info(f"New file detected: {filename} ({file_size} bytes)")
 

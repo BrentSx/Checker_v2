@@ -79,6 +79,14 @@ def _extract_zip(archive_path: str, dest_dir: str, password: Optional[str] = Non
         return count
     except NotImplementedError:
         # Python's zipfile doesn't support this compression (Deflate64, Zstandard, etc.)
+        # Clean up any partially extracted files before falling back to CLI
+        # (the CLI tool will re-extract everything from scratch).
+        if count > 0:
+            try:
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                os.makedirs(dest_dir, exist_ok=True)
+            except OSError:
+                pass
         log.warning(
             f"Python zipfile can't handle compression in {os.path.basename(archive_path)}, "
             "falling back to CLI..."

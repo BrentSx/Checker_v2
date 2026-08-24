@@ -9,7 +9,6 @@ this service orchestrates it as a subprocess.
 import asyncio
 import json
 import os
-import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path

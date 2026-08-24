@@ -75,8 +75,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning(f"Failed to load Discord webhook from DB: {e}")
 
-    # Clean up old results directories (older than 7 days)
+    # Clean up old results directories (older than 7 days) and stale temp dirs
     await _cleanup_old_results()
+
+    # Reset any jobs stuck in mid-pipeline states from a previous crash
+    await _reset_stuck_jobs()
 
     await queue_manager.start()
     await watchdog.start()
@@ -142,11 +145,11 @@ async def _cleanup_old_results():
 
     Results directories are named ``YYYY-MM-DD_HH-MM-SS`` under RESULTS_DIR.
     """
-    from backend.config import RESULTS_DIR
+    from backend.config import RESULTS_DIR, TEMP_DIR
     import shutil
-    from datetime import timedelta
+    from datetime import datetime as dt, timedelta, timezone as tz
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    cutoff = dt.now(tz.utc) - timedelta(days=7)
     cleaned = 0
 
     try:
@@ -155,8 +158,8 @@ async def _cleanup_old_results():
                 continue
             # Parse the directory name as a timestamp
             try:
-                dir_time = datetime.strptime(entry.name, "%Y-%m-%d_%H-%M-%S")
-                dir_time = dir_time.replace(tzinfo=timezone.utc)
+                dir_time = dt.strptime(entry.name, "%Y-%m-%d_%H-%M-%S")
+                dir_time = dir_time.replace(tzinfo=tz.utc)
             except ValueError:
                 continue
 
@@ -168,6 +171,52 @@ async def _cleanup_old_results():
 
     if cleaned > 0:
         log.info(f"Cleaned up {cleaned} old results director{'y' if cleaned == 1 else 'ies'}")
+
+    # Also clean up orphaned temp/extraction directories from crashed jobs.
+    # Temp dirs are named ``job_XXXXXXXX`` under TEMP_DIR.
+    temp_cleaned = 0
+    try:
+        for entry in TEMP_DIR.iterdir():
+            if entry.is_dir() and entry.name.startswith("job_"):
+                shutil.rmtree(entry, ignore_errors=True)
+                temp_cleaned += 1
+    except Exception as e:
+        log.warning(f"Temp cleanup error: {e}")
+
+    if temp_cleaned > 0:
+        log.info(f"Cleaned up {temp_cleaned} orphaned temp director{'y' if temp_cleaned == 1 else 'ies'}")
+
+
+async def _reset_stuck_jobs():
+    """Reset jobs stuck in mid-pipeline states back to queued.
+
+    If the app crashes or is killed while processing, jobs can get stuck in
+    ``downloading``, ``extracting``, ``checking``, etc. forever.  On startup,
+    reset them so they get retried automatically.
+    """
+    from backend.models import Job, JobStatus
+
+    IN_PROGRESS_STATES = [
+        JobStatus.downloading, JobStatus.downloaded, JobStatus.extracting,
+        JobStatus.checking, JobStatus.processing_results,
+        JobStatus.sending_discord, JobStatus.cleaning_up,
+    ]
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Job).where(Job.status.in_(IN_PROGRESS_STATES))
+        )
+        stuck = result.scalars().all()
+        for job in stuck:
+            old_status = job.status.value
+            job.status = JobStatus.queued
+            job.error_message = f"Reset from stuck state ({old_status}) on startup"
+            job.progress = 0.0
+            job.download_speed = 0
+        await session.commit()
+
+    if stuck:
+        log.info(f"Reset {len(stuck)} stuck job(s) back to queued")
 
 
 # Create FastAPI app

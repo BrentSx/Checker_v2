@@ -135,9 +135,9 @@ class Watchdog:
         ds = discord_service.status()
         if ds["configured"]:
             last_err = ds["last_error"] or ""
-            # 413 = "file too large" — not a connectivity problem, don't treat
-            # it as unhealthy (the webhook itself works fine).
-            if last_err and "413" not in last_err:
+            # 413 = "file too large", 429 = "rate limited" — neither is a
+            # connectivity problem.  The webhook itself works fine.
+            if last_err and "413" not in last_err and "429" not in last_err:
                 dc.mark_unhealthy(last_err)
             else:
                 dc.mark_healthy()
@@ -204,9 +204,13 @@ class Watchdog:
         try:
             if name == "Telegram":
                 from backend.services.telegram_service import telegram_service
+                from backend.workers.telegram_monitor import telegram_monitor
+                await telegram_monitor.stop()
                 await telegram_service.disconnect()
                 await asyncio.sleep(2)
                 await telegram_service.start()
+                if telegram_service.is_ready:
+                    await telegram_monitor.start()
 
             elif name == "Queue" or name == "Downloader":
                 from backend.workers.queue_manager import queue_manager

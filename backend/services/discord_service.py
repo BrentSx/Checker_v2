@@ -43,7 +43,9 @@ class DiscordService:
             # Use certifi CA bundle — CentOS 7 custom Python can't find system certs
             ssl_ctx = ssl.create_default_context(cafile=certifi.where())
             connector = aiohttp.TCPConnector(ssl=ssl_ctx)
-            self._session = aiohttp.ClientSession(connector=connector)
+            # 30s total timeout prevents hanging on unresponsive Discord API
+            timeout = aiohttp.ClientTimeout(total=30)
+            self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self._session
 
     def configure(self, webhook_url: str):
@@ -60,14 +62,14 @@ class DiscordService:
     async def send_message(self, content: str, embeds: list[dict] | None = None) -> bool:
         """Send a text message to Discord.
 
-        Automatically retries on 429 (rate limit).
+        Automatically retries on 429 (rate limit) and transient network errors.
         """
         if not self._webhook_url:
             log.warning("Discord webhook not configured")
             return False
 
-        max_429_retries = 5
-        for attempt in range(max_429_retries + 1):
+        max_retries = 5
+        for attempt in range(max_retries + 1):
             try:
                 session = await self._get_session()
                 payload = {}
@@ -96,17 +98,33 @@ class DiscordService:
                         await asyncio.sleep(retry_after)
                         continue
 
+                    if resp.status >= 500 and attempt < max_retries:
+                        # Discord server error — retry after backoff
+                        wait = 2 ** attempt
+                        log.warning(f"Discord server error ({resp.status}), retrying in {wait}s...")
+                        await asyncio.sleep(wait)
+                        continue
+
                     body = await resp.text()
                     self._last_error = f"HTTP {resp.status}: {body[:200]}"
                     log.error(f"Discord webhook failed: {self._last_error}")
                     return False
 
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    log.warning(f"Discord network error ({e}), retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                self._last_error = str(e)
+                log.error(f"Discord send failed after {max_retries + 1} attempts: {e}")
+                return False
             except Exception as e:
                 self._last_error = str(e)
                 log.error(f"Discord send failed: {e}")
                 return False
 
-        self._last_error = "Rate limited (429) after max retries"
+        self._last_error = "Failed after max retries"
         return False
 
     async def send_embed(
@@ -203,12 +221,12 @@ class DiscordService:
     async def _upload_file(self, data: bytes, filename: str, content: str = "") -> bool:
         """Upload a single file to Discord webhook.
 
-        Automatically retries on 429 (rate limit) with the delay Discord
-        specifies in the ``retry_after`` response field.
+        Automatically retries on 429 (rate limit), 5xx server errors, and
+        transient network errors.
         """
-        max_429_retries = 5
+        max_retries = 5
 
-        for attempt in range(max_429_retries + 1):
+        for attempt in range(max_retries + 1):
             try:
                 session = await self._get_session()
                 form = aiohttp.FormData()
@@ -225,19 +243,24 @@ class DiscordService:
 
                     if resp.status == 429:
                         body_text = await resp.text()
-                        # Discord returns {"retry_after": <seconds>}
-                        retry_after = 5  # default
+                        retry_after = 5
                         try:
                             body_json = json.loads(body_text)
                             retry_after = float(body_json.get("retry_after", 5))
                         except (json.JSONDecodeError, ValueError):
                             pass
-                        retry_after = min(retry_after, 60)  # cap at 60s
+                        retry_after = min(retry_after, 60)
                         log.warning(
                             f"Discord rate limited (429), waiting {retry_after:.1f}s "
-                            f"(attempt {attempt + 1}/{max_429_retries + 1})"
+                            f"(attempt {attempt + 1}/{max_retries + 1})"
                         )
                         await asyncio.sleep(retry_after)
+                        continue
+
+                    if resp.status >= 500 and attempt < max_retries:
+                        wait = 2 ** attempt
+                        log.warning(f"Discord server error ({resp.status}), retrying in {wait}s...")
+                        await asyncio.sleep(wait)
                         continue
 
                     body = await resp.text()
@@ -245,12 +268,21 @@ class DiscordService:
                     log.error(f"Discord file upload failed: {self._last_error}")
                     return False
 
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    log.warning(f"Discord upload network error ({e}), retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                self._last_error = str(e)
+                log.error(f"Discord file upload failed after {max_retries + 1} attempts: {e}")
+                return False
             except Exception as e:
                 self._last_error = str(e)
                 log.error(f"Discord file upload error: {e}")
                 return False
 
-        self._last_error = "Rate limited (429) after max retries"
+        self._last_error = "Failed after max retries"
         log.error(f"Discord upload failed: {self._last_error}")
         return False
 

@@ -285,7 +285,7 @@ class QueueManager:
 
             # Update statistics — wrapped so a stats error can't un-complete the job
             try:
-                await self._update_stats(job, checker_result, total_time)
+                await self._update_stats(job.id, checker_result, total_time)
             except Exception as stats_err:
                 log_j.warning(f"Stats update failed (job still completed): {stats_err}")
 
@@ -588,10 +588,20 @@ class QueueManager:
                     job.started_at = datetime.now(timezone.utc)
                 await session.commit()
 
-    async def _update_stats(self, job: Job, result, elapsed: float):
-        """Update daily statistics."""
+    async def _update_stats(self, job_id: str, result, elapsed: float):
+        """Update daily statistics.
+
+        Accepts ``job_id`` (not a detached Job object) so it can fetch the
+        latest state from the database — in particular ``discord_sent`` and
+        ``file_size`` which are updated during the pipeline after the
+        original object was loaded.
+        """
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         async with async_session() as session:
+            # Fetch fresh job state so discord_sent / file_size are current
+            job_result = await session.execute(select(Job).where(Job.id == job_id))
+            fresh_job = job_result.scalar_one_or_none()
+
             stat_result = await session.execute(
                 select(Statistic).where(Statistic.date == today)
             )
@@ -602,9 +612,13 @@ class QueueManager:
 
             stat.jobs_completed = (stat.jobs_completed or 0) + 1
             stat.files_checked = (stat.files_checked or 0) + result.total
-            stat.data_downloaded_bytes = (stat.data_downloaded_bytes or 0) + (job.file_size or 0)
+            stat.data_downloaded_bytes = (stat.data_downloaded_bytes or 0) + (
+                fresh_job.file_size if fresh_job else 0
+            )
             stat.total_processing_seconds = (stat.total_processing_seconds or 0) + elapsed
-            stat.discord_messages_sent = (stat.discord_messages_sent or 0) + (1 if job.discord_sent else 0)
+            stat.discord_messages_sent = (stat.discord_messages_sent or 0) + (
+                1 if fresh_job and fresh_job.discord_sent else 0
+            )
             await session.commit()
 
     # ── Public job management ───────────────────────────────────────────────
@@ -752,7 +766,7 @@ class QueueManager:
             await hub.broadcast("job_complete", {"job_id": job_id, "filename": job.filename})
 
             try:
-                await self._update_stats(job, checker_result, total_time)
+                await self._update_stats(job_id, checker_result, total_time)
             except Exception as stats_err:
                 log_j.warning(f"Stats update failed (job still completed): {stats_err}")
 
