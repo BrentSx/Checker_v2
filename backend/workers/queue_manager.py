@@ -361,10 +361,17 @@ class QueueManager:
 
         if part1_path is None:
             if job.telegram_channel_id and job.telegram_message_id:
-                # Don't waste retries on a disconnected Telegram client
+                # Wait for Telegram to be ready (up to 30s) instead of burning
+                # a retry attempt on a startup race.
+                if not telegram_service.is_ready:
+                    log.info("Waiting for Telegram to connect...")
+                    for _ in range(15):
+                        await asyncio.sleep(2)
+                        if telegram_service.is_ready:
+                            break
                 if not telegram_service.is_ready:
                     raise RuntimeError(
-                        "Telegram is not connected — waiting for reconnection"
+                        "Telegram is not connected after 30s — waiting for reconnection"
                     )
                 part1_path = await telegram_service.download_file(
                     job.telegram_channel_id,
@@ -380,6 +387,12 @@ class QueueManager:
 
         # ── Fetch sibling volumes for multi-part archives ─────────────────────
         if part1_path and job.telegram_channel_id and job.telegram_message_id:
+            if not telegram_service.is_ready:
+                log.info("Waiting for Telegram to connect (for volume fetch)...")
+                for _ in range(15):
+                    await asyncio.sleep(2)
+                    if telegram_service.is_ready:
+                        break
             if not telegram_service.is_ready:
                 raise RuntimeError(
                     "Telegram is not connected — cannot fetch archive volumes"

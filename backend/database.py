@@ -3,7 +3,7 @@
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool
 
 from backend.config import DATABASE_URL
 
@@ -12,12 +12,16 @@ engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     future=True,
-    # Use StaticPool to serialize all writes through a single connection.
-    # NullPool (the aiosqlite default) doesn't accept pool_size/max_overflow,
-    # but StaticPool gives us one reusable connection — perfect for SQLite.
-    poolclass=StaticPool,
+    # NullPool: each session gets its own connection, disposed on close.
+    # StaticPool (single shared connection) caused "database is locked"
+    # when multiple async coroutines (download progress callbacks, watchdog
+    # health checks, API requests) tried to write concurrently — SQLite
+    # can't multiplex transactions on a single connection.
+    # With NullPool + WAL mode + busy_timeout, SQLite handles concurrency
+    # properly: one writer + multiple readers, with automatic retry on lock.
+    poolclass=NullPool,
     connect_args={
-        "timeout": 30,  # wait up to 30s for the lock instead of failing instantly
+        "timeout": 60,  # wait up to 60s for the lock instead of failing instantly
     },
 )
 
@@ -31,7 +35,7 @@ def _set_sqlite_pragmas(dbapi_conn, connection_record):
     """
     cursor = dbapi_conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA busy_timeout=30000")
+    cursor.execute("PRAGMA busy_timeout=60000")
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.close()
 
