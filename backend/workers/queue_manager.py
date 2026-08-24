@@ -30,6 +30,15 @@ from backend.workers.extractor import extract_archive
 log = ComponentLogger("Queue")
 
 
+class _DiskFullError(RuntimeError):
+    """Raised when there's not enough disk space to proceed.
+
+    Treated specially by _handle_failure: skips retries and pauses the queue
+    so it doesn't immediately burn through all queued jobs with the same error.
+    """
+    pass
+
+
 class QueueManager:
     """Manages the job processing queue. Processes one job at a time."""
 
@@ -208,7 +217,25 @@ class QueueManager:
             else:
                 log_j.info(f"Extracting: {job.filename}")
             extract_dir = str(TEMP_DIR / f"job_{job.id[:8]}")
-            files_extracted = await extract_archive(download_path, extract_dir, password=archive_password)
+
+            try:
+                files_extracted = await extract_archive(download_path, extract_dir, password=archive_password)
+            except RuntimeError as exc:
+                err_lower = str(exc).lower()
+                # If extraction failed due to disk space, scan whatever got extracted
+                if "no space" in err_lower or "disk full" in err_lower or "no space left" in err_lower:
+                    partial_count = sum(1 for _ in Path(extract_dir).rglob("*") if _.is_file()) if os.path.exists(extract_dir) else 0
+                    if partial_count > 0:
+                        log_j.warning(
+                            f"Disk full during extraction — scanning {partial_count} "
+                            f"files that were extracted before space ran out"
+                        )
+                        files_extracted = partial_count
+                    else:
+                        raise
+                else:
+                    raise
+
             log_j.info(f"Extracted {files_extracted} files")
             await self._update_job(job.id, {
                 "extract_dir": extract_dir,
@@ -302,10 +329,20 @@ class QueueManager:
         try:
             import shutil as _shutil
             disk = _shutil.disk_usage(dest_dir)
-            free_gb = disk.free / (1024 ** 3)
-            file_gb = (job.file_size or 0) / (1024 ** 3)
-            # Need roughly 3× the file size (download + extraction + results)
-            needed_gb = max(file_gb * 3, 2)  # at least 2 GB free
+            free_bytes = disk.free
+            free_gb = free_bytes / (1024 ** 3)
+            file_size = job.file_size or 0
+            file_gb = file_size / (1024 ** 3)
+
+            # If less than 1 GB free, skip the download entirely
+            if free_gb < 1.0:
+                raise _DiskFullError(
+                    f"Only {free_gb:.1f} GB free — skipping download of "
+                    f"{job.filename} ({file_gb:.1f} GB)"
+                )
+
+            # Warn if tight (need ~3× file size for download+extract+results)
+            needed_gb = max(file_gb * 3, 2)
             if free_gb < needed_gb:
                 log.warning(
                     f"LOW DISK SPACE: {free_gb:.1f} GB free, need ~{needed_gb:.1f} GB "
@@ -313,6 +350,8 @@ class QueueManager:
                 )
             else:
                 log.info(f"Disk space OK: {free_gb:.1f} GB free")
+        except _DiskFullError:
+            raise
         except Exception:
             pass
 
@@ -466,11 +505,39 @@ class QueueManager:
                 log.warning(f"Failed to remove extract dir: {e}")
 
     async def _handle_failure(self, job: Job, error: str):
-        """Handle a failed job — retry or mark as failed."""
+        """Handle a failed job — retry or mark as failed.
+
+        Disk-full errors skip retries entirely and pause the queue so we
+        don't immediately chew through every queued job with the same error.
+        """
+        # Detect disk-full errors (from _DiskFullError or extraction "no space")
+        err_lower = error.lower()
+        is_disk_full = "no space" in err_lower or "disk full" in err_lower or isinstance(error, _DiskFullError)
+
         async with async_session() as session:
             result = await session.execute(select(Job).where(Job.id == job.id))
             db_job = result.scalar_one_or_none()
             if not db_job:
+                return
+
+            if is_disk_full:
+                # Don't retry — mark failed and pause queue
+                db_job.status = JobStatus.failed
+                db_job.error_message = f"Disk full: {error}"
+                db_job.completed_at = datetime.now(timezone.utc)
+                await session.commit()
+                log.error(f"Job {job.id[:8]} failed (disk full) — pausing queue")
+                self._paused = True
+                await hub.broadcast("job_failed", {"job_id": job.id, "error": error})
+                # Clean up temp files to free some space
+                try:
+                    if db_job.download_path and os.path.exists(db_job.download_path):
+                        os.remove(db_job.download_path)
+                    extract_dir = str(TEMP_DIR / f"job_{job.id[:8]}")
+                    if os.path.exists(extract_dir):
+                        shutil.rmtree(extract_dir, ignore_errors=True)
+                except Exception:
+                    pass
                 return
 
             if db_job.retry_count < db_job.max_retries:
@@ -665,7 +732,24 @@ class QueueManager:
             else:
                 log_j.info(f"Extracting: {job.filename}")
             extract_dir = str(TEMP_DIR / f"job_{job_id[:8]}")
-            files_extracted = await extract_archive(download_path, extract_dir, password=archive_password)
+
+            try:
+                files_extracted = await extract_archive(download_path, extract_dir, password=archive_password)
+            except RuntimeError as exc:
+                err_lower = str(exc).lower()
+                if "no space" in err_lower or "disk full" in err_lower:
+                    partial_count = sum(1 for _ in Path(extract_dir).rglob("*") if _.is_file()) if os.path.exists(extract_dir) else 0
+                    if partial_count > 0:
+                        log_j.warning(
+                            f"Disk full during extraction — scanning {partial_count} "
+                            f"files that were extracted before space ran out"
+                        )
+                        files_extracted = partial_count
+                    else:
+                        raise
+                else:
+                    raise
+
             log_j.info(f"Extracted {files_extracted} files")
             await self._update_job(job_id, {
                 "extract_dir": extract_dir,

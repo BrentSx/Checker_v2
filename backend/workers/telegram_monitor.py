@@ -4,6 +4,13 @@ import asyncio
 import re
 from typing import Optional
 
+# Multi-part RAR: skip anything that isn't part1 / part01 — those parts can't
+# extract on their own and would just waste download bandwidth + retries.
+_MULTIPART_RAR_SKIP = re.compile(
+    r"\.part(?!0*1\.rar)(\d+)\.rar$",
+    re.IGNORECASE,
+)
+
 from sqlalchemy import select
 
 from backend.logging_config import ComponentLogger
@@ -136,6 +143,10 @@ class TelegramMonitor:
                     if not any(fname.lower().endswith(ext) for ext in ARCHIVE_EXTS):
                         continue
 
+                    # Skip non-first parts of multi-part RARs — they can't extract alone
+                    if _MULTIPART_RAR_SKIP.search(fname):
+                        continue
+
                     key = (channel_id, msg["id"])
                     if key in self._processed_messages:
                         continue
@@ -220,6 +231,11 @@ class TelegramMonitor:
         # Only process archive files
         lower = filename.lower()
         if not any(lower.endswith(ext) for ext in (".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz")):
+            return
+
+        # Skip non-first parts of multi-part RARs — they can't extract alone
+        if _MULTIPART_RAR_SKIP.search(lower):
+            log.info(f"Skipping multi-part RAR (not part1): {filename}")
             return
 
         # Check DB for duplicates — the in-memory set is empty after restart,

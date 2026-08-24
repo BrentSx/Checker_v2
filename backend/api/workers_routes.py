@@ -290,6 +290,10 @@ async def get_telegram_archives(
                 fname = msg["file_name"]
                 if not any(fname.lower().endswith(ext) for ext in ARCHIVE_EXTS):
                     continue
+                # Skip non-first parts of multi-part RARs
+                from backend.workers.telegram_monitor import _MULTIPART_RAR_SKIP
+                if _MULTIPART_RAR_SKIP.search(fname):
+                    continue
                 archives.append({
                     **msg,
                     "channel_id": channel_id,
