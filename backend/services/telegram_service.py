@@ -326,8 +326,10 @@ class TelegramService:
     ) -> Optional[str]:
         """Download a file from a Telegram message.
 
-        Uses Telethon's download_media which handles DC routing, chunking,
-        and retries internally.  tgcrypto speeds up the crypto layer.
+        Optimized for Telegram Premium:
+        - Uses ``iter_download`` with 1 MB request size (fewer round-trips)
+        - Streams directly to disk (no full-file memory buffer)
+        - tgcrypto accelerates the AES-IGE decryption layer
 
         If the client is disconnected, automatically reconnects and retries
         once before raising.
@@ -365,18 +367,35 @@ class TelegramService:
                 log.info(f"Downloading {file_name} ({_format_size(file_size)})")
                 start_time = time.monotonic()
 
-                # Wrap progress to check for cancellation
-                async def checked_progress(current, total):
-                    if self._cancel_event and self._cancel_event.is_set():
-                        raise asyncio.CancelledError("Download cancelled by user")
-                    if progress_callback:
-                        await progress_callback(current, total)
+                # ── Premium-optimized streaming download ─────────────
+                # 1 MB chunks = fewer round-trips → higher throughput
+                # for Premium accounts that have server-side speed caps
+                # lifted.  Streams to disk so multi-GB files don't eat RAM.
+                REQUEST_SIZE = 1024 * 1024  # 1 MB
 
-                await self._client.download_media(
-                    msg,
-                    file=dest_path,
-                    progress_callback=checked_progress,
-                )
+                downloaded = 0
+                last_cb = 0.0  # throttle progress callbacks to ~500 ms
+
+                with open(dest_path, "wb") as fd:
+                    async for chunk in self._client.iter_download(
+                        msg.document,
+                        offset=0,
+                        request_size=REQUEST_SIZE,
+                        file_size=file_size,
+                    ):
+                        # Cancellation check
+                        if self._cancel_event and self._cancel_event.is_set():
+                            raise asyncio.CancelledError("Download cancelled by user")
+
+                        fd.write(chunk)
+                        downloaded += len(chunk)
+
+                        # Progress callback (throttled)
+                        if progress_callback:
+                            now = time.monotonic()
+                            if now - last_cb >= 0.5 or downloaded >= file_size:
+                                await progress_callback(downloaded, file_size)
+                                last_cb = now
 
                 elapsed = time.monotonic() - start_time
                 speed = file_size / elapsed if elapsed > 0 else 0

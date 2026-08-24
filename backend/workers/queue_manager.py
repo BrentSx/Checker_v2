@@ -510,14 +510,35 @@ class QueueManager:
         Disk-full errors skip retries entirely and pause the queue so we
         don't immediately chew through every queued job with the same error.
         """
-        # Detect disk-full errors (from _DiskFullError or extraction "no space")
+        # Detect errors that should NOT be retried
         err_lower = error.lower()
         is_disk_full = "no space" in err_lower or "disk full" in err_lower or isinstance(error, _DiskFullError)
+        # Multi-part RAR that isn't the first volume — retrying won't help
+        is_bad_volume = "previous volume" in err_lower or "first volume" in err_lower
 
         async with async_session() as session:
             result = await session.execute(select(Job).where(Job.id == job.id))
             db_job = result.scalar_one_or_none()
             if not db_job:
+                return
+
+            if is_bad_volume:
+                # This file can never extract — fail immediately, no retries
+                db_job.status = JobStatus.failed
+                db_job.error_message = "Multi-part RAR (not part1) — cannot extract alone"
+                db_job.completed_at = datetime.now(timezone.utc)
+                await session.commit()
+                log.warning(f"Job {job.id[:8]} skipped — not the first volume of a multi-part RAR")
+                await hub.broadcast("job_failed", {"job_id": job.id, "error": db_job.error_message})
+                # Clean up the download
+                try:
+                    if db_job.download_path and os.path.exists(db_job.download_path):
+                        os.remove(db_job.download_path)
+                    extract_dir = str(TEMP_DIR / f"job_{job.id[:8]}")
+                    if os.path.exists(extract_dir):
+                        shutil.rmtree(extract_dir, ignore_errors=True)
+                except Exception:
+                    pass
                 return
 
             if is_disk_full:
