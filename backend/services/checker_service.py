@@ -253,10 +253,20 @@ class CheckerService:
                 for filepath, line in matched_lines:
                     out.write(f"{filepath}\t{line}\n")
 
-        # NOTE: We intentionally do NOT copy cookie files to found_cookies/.
-        # The matched_lines.txt has all the useful data, and copying 13K+ files
-        # (often 800+ MB) wastes disk I/O for no benefit — the Discord zip only
-        # sends the summary files anyway.
+        # Copy the actual cookie files so they get sent to Discord
+        if cookie_files:
+            import shutil
+            cookies_dir = run_dir / "found_cookies"
+            cookies_dir.mkdir(parents=True, exist_ok=True)
+            for f in cookie_files:
+                try:
+                    rel = f.relative_to(extract_path)
+                    dest = cookies_dir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, dest)
+                except Exception:
+                    pass
+            log_j.info(f"Copied {len(cookie_files)} cookie files to results")
 
         log_j.info(
             f"Scan complete: {result.total} .txt files, "

