@@ -75,6 +75,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning(f"Failed to load Discord webhook from DB: {e}")
 
+    # Clean up old results directories (older than 7 days)
+    await _cleanup_old_results()
+
     await queue_manager.start()
     await watchdog.start()
 
@@ -132,6 +135,39 @@ async def _ensure_admin():
             session.add(admin)
             await session.commit()
             log.info("Admin account created with initial password")
+
+
+async def _cleanup_old_results():
+    """Remove results directories older than 7 days to prevent disk bloat.
+
+    Results directories are named ``YYYY-MM-DD_HH-MM-SS`` under RESULTS_DIR.
+    """
+    from backend.config import RESULTS_DIR
+    import shutil
+    from datetime import timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    cleaned = 0
+
+    try:
+        for entry in RESULTS_DIR.iterdir():
+            if not entry.is_dir():
+                continue
+            # Parse the directory name as a timestamp
+            try:
+                dir_time = datetime.strptime(entry.name, "%Y-%m-%d_%H-%M-%S")
+                dir_time = dir_time.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+
+            if dir_time < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+                cleaned += 1
+    except Exception as e:
+        log.warning(f"Results cleanup error: {e}")
+
+    if cleaned > 0:
+        log.info(f"Cleaned up {cleaned} old results director{'y' if cleaned == 1 else 'ies'}")
 
 
 # Create FastAPI app

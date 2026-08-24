@@ -97,7 +97,7 @@ def _extract_zip_cli(archive_path: str, dest_dir: str, password: Optional[str] =
         tool_name = tool_cmd[0]
         try:
             result = subprocess.run(
-                tool_cmd, capture_output=True, text=True, timeout=600,
+                tool_cmd, capture_output=True, text=True, timeout=7200,
             )
             if result.returncode == 0:
                 count = sum(1 for _ in Path(dest_dir).rglob("*") if _.is_file())
@@ -134,30 +134,49 @@ def _zip_cli_commands(archive_path: str, dest_dir: str, password: Optional[str] 
 
 
 def _extract_rar(archive_path: str, dest_dir: str, password: Optional[str] = None) -> int:
-    """Extract a RAR archive using rarfile."""
+    """Extract a RAR archive.
+
+    For multi-volume archives (.partNN.rar / .rNN) we go straight to the CLI
+    ``unrar`` because the Python ``rarfile`` library frequently chokes on them.
+    Single-volume archives try ``rarfile`` first, then fall back to CLI.
+    """
+    import re
+    basename = os.path.basename(archive_path).lower()
+    is_multivolume = bool(re.search(r"\.part\d+\.rar$", basename)) or bool(
+        re.search(r"\.r\d{2,}$", basename)
+    )
+
+    if is_multivolume:
+        log.info(f"Multi-volume RAR detected — using CLI unrar for {os.path.basename(archive_path)}")
+        return _extract_rar_cli(archive_path, dest_dir, password)
+
+    # Single-volume: try Python rarfile first, fall back to CLI
     try:
         import rarfile
     except ImportError:
-        # Fall back to unrar command
         return _extract_rar_cli(archive_path, dest_dir, password)
 
-    count = 0
-    with rarfile.RarFile(archive_path, "r") as rf:
-        if password:
-            rf.setpassword(password)
-        for info in rf.infolist():
-            if info.is_dir():
-                continue
-            safe_path = _safe_path(info.filename)
-            if not safe_path:
-                continue
-            target = os.path.join(dest_dir, safe_path)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with rf.open(info, pwd=password) as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            count += 1
-    log.info(f"RAR extracted: {count} files from {os.path.basename(archive_path)}")
-    return count
+    try:
+        count = 0
+        with rarfile.RarFile(archive_path, "r") as rf:
+            if password:
+                rf.setpassword(password)
+            for info in rf.infolist():
+                if info.is_dir():
+                    continue
+                safe_path = _safe_path(info.filename)
+                if not safe_path:
+                    continue
+                target = os.path.join(dest_dir, safe_path)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with rf.open(info, pwd=password) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                count += 1
+        log.info(f"RAR extracted: {count} files from {os.path.basename(archive_path)}")
+        return count
+    except Exception as e:
+        log.warning(f"Python rarfile failed ({e}), falling back to CLI unrar...")
+        return _extract_rar_cli(archive_path, dest_dir, password)
 
 
 def _extract_rar_cli(archive_path: str, dest_dir: str, password: Optional[str] = None) -> int:
@@ -170,7 +189,7 @@ def _extract_rar_cli(archive_path: str, dest_dir: str, password: Optional[str] =
         cmd.append("-p-")  # no password prompt
     cmd.extend([archive_path, dest_dir + "/"])
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=600,
+        cmd, capture_output=True, text=True, timeout=7200,  # 2 hours for multi-volume
     )
     if result.returncode != 0:
         raise RuntimeError(f"unrar failed: {result.stderr[:200]}")
@@ -202,7 +221,7 @@ def _extract_7z(archive_path: str, dest_dir: str, password: Optional[str] = None
             cmd.append("-p")  # don't prompt
         cmd.append(archive_path)
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600,
+            cmd, capture_output=True, text=True, timeout=7200,
         )
         if result.returncode != 0:
             raise RuntimeError(f"7z failed: {result.stderr[:200]}")

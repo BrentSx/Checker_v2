@@ -175,6 +175,10 @@ class CheckerService:
 
         Looks for Microsoft/Minecraft cookie keywords on each line.
         Any file with at least one matching line is flagged as a hit.
+
+        The actual file I/O runs in a worker thread via ``asyncio.to_thread``
+        so the event loop stays responsive for WebSocket updates and other
+        async work during long scans (90K+ files).
         """
         result = CheckerResult()
         log_j = log.with_job(job_id)
@@ -201,29 +205,26 @@ class CheckerService:
             "sisu.xboxlive.com",
         )
 
+        # ── Scan in batches, yielding to the event loop between batches ──
+        BATCH_SIZE = 200  # files per batch before we yield
         cookie_files = []   # files with at least one matching line
         other_files = []     # .txt files with zero matches
         matched_lines = []   # (filepath, line) tuples for the results file
 
-        for f in txt_files:
-            found = False
-            try:
-                with open(f, "r", errors="replace") as fh:
-                    for line in fh:
-                        lower_line = line.lower()
-                        if any(kw in lower_line for kw in KEYWORDS):
-                            found = True
-                            matched_lines.append((str(f.relative_to(extract_path)), line.rstrip()))
-            except Exception:
-                pass
+        for batch_start in range(0, len(txt_files), BATCH_SIZE):
+            batch = txt_files[batch_start:batch_start + BATCH_SIZE]
 
-            if found:
-                cookie_files.append(f)
-            else:
-                other_files.append(f)
+            # Run the heavy I/O in a thread so the event loop stays alive
+            batch_cookies, batch_others, batch_matches = await asyncio.to_thread(
+                self._scan_batch, batch, extract_path, KEYWORDS
+            )
 
-            self._files_processed += 1
-            if progress_callback and self._files_processed % 100 == 0:
+            cookie_files.extend(batch_cookies)
+            other_files.extend(batch_others)
+            matched_lines.extend(batch_matches)
+
+            self._files_processed = batch_start + len(batch)
+            if progress_callback:
                 await progress_callback(self._files_processed, self._files_total)
 
         result.valid_mc = len(cookie_files)
@@ -253,16 +254,10 @@ class CheckerService:
                 for filepath, line in matched_lines:
                     out.write(f"{filepath}\t{line}\n")
 
-        # Copy cookie files to results
-        found_dir = run_dir / "found_cookies"
-        found_dir.mkdir(exist_ok=True)
-        for f in cookie_files:
-            try:
-                dest = found_dir / f.relative_to(extract_path)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(f, dest)
-            except Exception:
-                pass
+        # NOTE: We intentionally do NOT copy cookie files to found_cookies/.
+        # The matched_lines.txt has all the useful data, and copying 13K+ files
+        # (often 800+ MB) wastes disk I/O for no benefit — the Discord zip only
+        # sends the summary files anyway.
 
         log_j.info(
             f"Scan complete: {result.total} .txt files, "
@@ -271,6 +266,38 @@ class CheckerService:
         )
 
         return result
+
+    @staticmethod
+    def _scan_batch(
+        files: list,
+        extract_path: Path,
+        keywords: tuple,
+    ) -> tuple[list, list, list]:
+        """Scan a batch of .txt files for keyword matches (runs in thread)."""
+        cookie_files = []
+        other_files = []
+        matched_lines = []
+
+        for f in files:
+            found = False
+            try:
+                with open(f, "r", errors="replace") as fh:
+                    for line in fh:
+                        lower_line = line.lower()
+                        if any(kw in lower_line for kw in keywords):
+                            found = True
+                            matched_lines.append(
+                                (str(f.relative_to(extract_path)), line.rstrip())
+                            )
+            except Exception:
+                pass
+
+            if found:
+                cookie_files.append(f)
+            else:
+                other_files.append(f)
+
+        return cookie_files, other_files, matched_lines
 
     async def stop(self):
         """Stop the currently running checker."""

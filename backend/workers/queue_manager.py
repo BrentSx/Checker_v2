@@ -303,6 +303,24 @@ class QueueManager:
         dest_dir = str(DOWNLOAD_DIR)
         os.makedirs(dest_dir, exist_ok=True)
 
+        # ── Disk space check ────────────────────────────────────────────────
+        try:
+            import shutil as _shutil
+            disk = _shutil.disk_usage(dest_dir)
+            free_gb = disk.free / (1024 ** 3)
+            file_gb = (job.file_size or 0) / (1024 ** 3)
+            # Need roughly 3× the file size (download + extraction + results)
+            needed_gb = max(file_gb * 3, 2)  # at least 2 GB free
+            if free_gb < needed_gb:
+                log.warning(
+                    f"LOW DISK SPACE: {free_gb:.1f} GB free, need ~{needed_gb:.1f} GB "
+                    f"for {job.filename} ({file_gb:.1f} GB)"
+                )
+            else:
+                log.info(f"Disk space OK: {free_gb:.1f} GB free")
+        except Exception:
+            pass
+
         # Track download speed via byte deltas — reused for part1 and siblings.
         dl_state = {"last_bytes": 0, "last_time": time.monotonic(), "speed": 0}
 
@@ -506,6 +524,22 @@ class QueueManager:
 
                 log.error(f"Job {job.id[:8]} permanently failed after {db_job.max_retries} retries")
 
+                # Update failed job stats
+                try:
+                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    async with async_session() as stats_sess:
+                        stat_result = await stats_sess.execute(
+                            select(Statistic).where(Statistic.date == today)
+                        )
+                        stat = stat_result.scalar_one_or_none()
+                        if not stat:
+                            stat = Statistic(date=today)
+                            stats_sess.add(stat)
+                        stat.jobs_failed = (stat.jobs_failed or 0) + 1
+                        await stats_sess.commit()
+                except Exception:
+                    pass
+
                 # Notify Discord about failure
                 await discord_service.send_embed(
                     title="❌ CHECK FAILED",
@@ -516,10 +550,14 @@ class QueueManager:
 
                 await hub.broadcast("job_failed", {"job_id": job.id, "error": error})
 
-                # Cleanup on failure too
+                # Cleanup on failure — respect keep_downloads setting
                 try:
+                    keep = await self._should_keep_downloads()
                     if db_job.download_path and os.path.exists(db_job.download_path):
-                        os.remove(db_job.download_path)
+                        if keep:
+                            log.info(f"Keeping download after failure (keep-downloads ON): {os.path.basename(db_job.download_path)}")
+                        else:
+                            os.remove(db_job.download_path)
                     if db_job.extract_dir and os.path.exists(db_job.extract_dir):
                         shutil.rmtree(db_job.extract_dir, ignore_errors=True)
                 except Exception:

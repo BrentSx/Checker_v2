@@ -232,10 +232,17 @@ class Watchdog:
             log.error(f"Failed to restart {name}: {e}")
 
     async def restart_worker(self, name: str) -> bool:
-        """Manually restart a specific worker."""
+        """Manually restart a specific worker.
+
+        Unlike auto-restart, manual restarts always proceed and reset the
+        restart counter so the worker gets a fresh set of auto-restart attempts.
+        """
         if name not in self._workers:
             return False
         health = self._workers[name]
+        # Reset counters so manual restart isn't blocked by the auto-restart cap
+        health.restart_count = 0
+        health.consecutive_failures = 0
         await self._auto_restart(name, health)
         return True
 

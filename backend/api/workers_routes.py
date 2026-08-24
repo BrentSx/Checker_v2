@@ -332,8 +332,22 @@ async def queue_archive(
     if not target or not target.get("has_file"):
         raise HTTPException(status_code=404, detail="Message not found or has no file")
 
-    # Extract password from message text
+    # Check for duplicate — don't queue if a job for this message already exists
     from backend.workers.telegram_monitor import _extract_password
+    from sqlalchemy import select as sa_select
+    from backend.database import async_session as _async_session
+    from backend.models import Job
+    async with _async_session() as session:
+        dup = await session.execute(
+            sa_select(Job.id).where(
+                Job.telegram_channel_id == body.channel_id,
+                Job.telegram_message_id == body.message_id,
+            ).limit(1)
+        )
+        if dup.scalar_one_or_none() is not None:
+            raise HTTPException(status_code=409, detail="This file is already in the queue")
+
+    # Extract password from message text
     password = _extract_password(target.get("text", ""))
 
     job_id = await queue_manager.add_job(

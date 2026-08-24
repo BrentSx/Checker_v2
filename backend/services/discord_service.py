@@ -58,35 +58,56 @@ class DiscordService:
         }
 
     async def send_message(self, content: str, embeds: list[dict] | None = None) -> bool:
-        """Send a text message to Discord."""
+        """Send a text message to Discord.
+
+        Automatically retries on 429 (rate limit).
+        """
         if not self._webhook_url:
             log.warning("Discord webhook not configured")
             return False
 
-        try:
-            session = await self._get_session()
-            payload = {}
-            if content:
-                payload["content"] = content[:2000]  # Discord limit
-            if embeds:
-                payload["embeds"] = embeds[:10]  # Discord limit
+        max_429_retries = 5
+        for attempt in range(max_429_retries + 1):
+            try:
+                session = await self._get_session()
+                payload = {}
+                if content:
+                    payload["content"] = content[:2000]  # Discord limit
+                if embeds:
+                    payload["embeds"] = embeds[:10]  # Discord limit
 
-            async with session.post(self._webhook_url, json=payload) as resp:
-                if resp.status in (200, 204):
-                    self._last_success = datetime.now(timezone.utc)
-                    self._messages_sent += 1
-                    self._last_error = None
-                    return True
-                else:
+                async with session.post(self._webhook_url, json=payload) as resp:
+                    if resp.status in (200, 204):
+                        self._last_success = datetime.now(timezone.utc)
+                        self._messages_sent += 1
+                        self._last_error = None
+                        return True
+
+                    if resp.status == 429:
+                        body_text = await resp.text()
+                        retry_after = 5
+                        try:
+                            body_json = json.loads(body_text)
+                            retry_after = float(body_json.get("retry_after", 5))
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        retry_after = min(retry_after, 60)
+                        log.warning(f"Discord rate limited (429), waiting {retry_after:.1f}s")
+                        await asyncio.sleep(retry_after)
+                        continue
+
                     body = await resp.text()
                     self._last_error = f"HTTP {resp.status}: {body[:200]}"
                     log.error(f"Discord webhook failed: {self._last_error}")
                     return False
 
-        except Exception as e:
-            self._last_error = str(e)
-            log.error(f"Discord send failed: {e}")
-            return False
+            except Exception as e:
+                self._last_error = str(e)
+                log.error(f"Discord send failed: {e}")
+                return False
+
+        self._last_error = "Rate limited (429) after max retries"
+        return False
 
     async def send_embed(
         self,
@@ -180,30 +201,58 @@ class DiscordService:
         return False
 
     async def _upload_file(self, data: bytes, filename: str, content: str = "") -> bool:
-        """Upload a single file to Discord webhook."""
-        try:
-            session = await self._get_session()
-            form = aiohttp.FormData()
-            form.add_field("file", io.BytesIO(data), filename=filename)
-            if content:
-                form.add_field("content", content[:2000])
+        """Upload a single file to Discord webhook.
 
-            async with session.post(self._webhook_url, data=form) as resp:
-                if resp.status in (200, 204):
-                    self._last_success = datetime.now(timezone.utc)
-                    self._messages_sent += 1
-                    self._last_error = None
-                    return True
-                else:
+        Automatically retries on 429 (rate limit) with the delay Discord
+        specifies in the ``retry_after`` response field.
+        """
+        max_429_retries = 5
+
+        for attempt in range(max_429_retries + 1):
+            try:
+                session = await self._get_session()
+                form = aiohttp.FormData()
+                form.add_field("file", io.BytesIO(data), filename=filename)
+                if content:
+                    form.add_field("content", content[:2000])
+
+                async with session.post(self._webhook_url, data=form) as resp:
+                    if resp.status in (200, 204):
+                        self._last_success = datetime.now(timezone.utc)
+                        self._messages_sent += 1
+                        self._last_error = None
+                        return True
+
+                    if resp.status == 429:
+                        body_text = await resp.text()
+                        # Discord returns {"retry_after": <seconds>}
+                        retry_after = 5  # default
+                        try:
+                            body_json = json.loads(body_text)
+                            retry_after = float(body_json.get("retry_after", 5))
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        retry_after = min(retry_after, 60)  # cap at 60s
+                        log.warning(
+                            f"Discord rate limited (429), waiting {retry_after:.1f}s "
+                            f"(attempt {attempt + 1}/{max_429_retries + 1})"
+                        )
+                        await asyncio.sleep(retry_after)
+                        continue
+
                     body = await resp.text()
                     self._last_error = f"HTTP {resp.status}: {body[:200]}"
                     log.error(f"Discord file upload failed: {self._last_error}")
                     return False
 
-        except Exception as e:
-            self._last_error = str(e)
-            log.error(f"Discord file upload error: {e}")
-            return False
+            except Exception as e:
+                self._last_error = str(e)
+                log.error(f"Discord file upload error: {e}")
+                return False
+
+        self._last_error = "Rate limited (429) after max retries"
+        log.error(f"Discord upload failed: {self._last_error}")
+        return False
 
     async def send_job_result(
         self,

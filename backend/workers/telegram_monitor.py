@@ -122,17 +122,20 @@ class TelegramMonitor:
             self._running = False
 
     async def _startup_scan(self, channel_ids: list[int]):
-        """On startup, find the latest archive file from monitored channels and queue it.
+        """On startup, find ALL unprocessed archive files from monitored channels.
 
         Checks the database first so restarts don't create duplicate jobs.
+        Queues every archive that doesn't already have a job record, not just
+        the latest — so nothing gets missed after a restart.
         """
-        log.info("Startup scan: looking for latest archive in monitored channels...")
+        log.info("Startup scan: looking for unprocessed archives in monitored channels...")
 
         ARCHIVE_EXTS = (".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz")
+        queued_count = 0
 
         for channel_id in channel_ids:
             try:
-                messages = await telegram_service.get_messages(channel_id, limit=20)
+                messages = await telegram_service.get_messages(channel_id, limit=50)
                 for msg in messages:
                     if not msg.get("has_file") or not msg.get("file_name"):
                         continue
@@ -142,7 +145,6 @@ class TelegramMonitor:
 
                     # Skip non-first parts of multi-part RAR archives
                     if _MULTIPART_RAR_SKIP.search(fname.lower()):
-                        log.info(f"Startup scan: skipping multi-part RAR (not part1): {fname}")
                         continue
 
                     key = (channel_id, msg["id"])
@@ -153,8 +155,7 @@ class TelegramMonitor:
                     already_exists = await self._job_exists(channel_id, msg["id"])
                     if already_exists:
                         self._processed_messages.add(key)
-                        log.info(f"Startup scan: skipping {fname} (already in queue)")
-                        break
+                        continue
 
                     self._processed_messages.add(key)
 
@@ -171,11 +172,15 @@ class TelegramMonitor:
                         telegram_message_id=msg["id"],
                         archive_password=password,
                     )
-                    # Only queue the latest one per channel
-                    break
+                    queued_count += 1
 
             except Exception as e:
                 log.warning(f"Startup scan failed for channel {channel_id}: {e}")
+
+        if queued_count > 0:
+            log.info(f"Startup scan queued {queued_count} archive(s)")
+        else:
+            log.info("Startup scan: all archives already processed")
 
     async def _job_exists(self, channel_id: int, message_id: int) -> bool:
         """Check if a job for this Telegram message already exists (any status)."""
