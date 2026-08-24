@@ -144,21 +144,8 @@ def _zip_cli_commands(archive_path: str, dest_dir: str, password: Optional[str] 
 def _extract_rar(archive_path: str, dest_dir: str, password: Optional[str] = None) -> int:
     """Extract a RAR archive.
 
-    For multi-volume archives (.partNN.rar / .rNN) we go straight to the CLI
-    ``unrar`` because the Python ``rarfile`` library frequently chokes on them.
-    Single-volume archives try ``rarfile`` first, then fall back to CLI.
+    Tries Python ``rarfile`` first, falls back to CLI ``unrar``.
     """
-    import re
-    basename = os.path.basename(archive_path).lower()
-    is_multivolume = bool(re.search(r"\.part\d+\.rar$", basename)) or bool(
-        re.search(r"\.r\d{2,}$", basename)
-    )
-
-    if is_multivolume:
-        log.info(f"Multi-volume RAR detected — using CLI unrar for {os.path.basename(archive_path)}")
-        return _extract_rar_cli(archive_path, dest_dir, password)
-
-    # Single-volume: try Python rarfile first, fall back to CLI
     try:
         import rarfile
     except ImportError:
@@ -197,7 +184,7 @@ def _extract_rar_cli(archive_path: str, dest_dir: str, password: Optional[str] =
         cmd.append("-p-")  # no password prompt
     cmd.extend([archive_path, dest_dir + "/"])
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=7200,  # 2 hours for multi-volume
+        cmd, capture_output=True, text=True, timeout=7200,
     )
     if result.returncode != 0:
         raise RuntimeError(f"unrar failed: {result.stderr[:200]}")

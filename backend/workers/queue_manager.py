@@ -22,7 +22,7 @@ from backend.database import async_session
 from backend.models import Job, JobStatus, Statistic
 from backend.logging_config import ComponentLogger
 from backend.websocket_hub import hub
-from backend.services.telegram_service import telegram_service, _sibling_matcher
+from backend.services.telegram_service import telegram_service
 from backend.services.discord_service import discord_service
 from backend.services.checker_service import checker_service
 from backend.workers.extractor import extract_archive
@@ -294,12 +294,7 @@ class QueueManager:
             await self._handle_failure(job, str(e))
 
     async def _download(self, job: Job) -> Optional[str]:
-        """Download the file for a job.
-
-        For multi-volume archives (``.part1.rar`` etc.) this also fetches the
-        sibling volumes so extraction has every part on disk — done even when the
-        first volume is already present from a previous attempt.
-        """
+        """Download the file for a job."""
         dest_dir = str(DOWNLOAD_DIR)
         os.makedirs(dest_dir, exist_ok=True)
 
@@ -380,34 +375,9 @@ class QueueManager:
                     progress_callback=progress,
                 )
             elif job.source_url:
-                # URL downloads can't resolve sibling volumes — return directly.
                 return await self._download_url(job, dest_dir)
             else:
                 raise RuntimeError("No download source configured for this job")
-
-        # ── Fetch sibling volumes for multi-part archives ─────────────────────
-        if part1_path and job.telegram_channel_id and job.telegram_message_id:
-            if not telegram_service.is_ready:
-                log.info("Waiting for Telegram to connect (for volume fetch)...")
-                for _ in range(15):
-                    await asyncio.sleep(2)
-                    if telegram_service.is_ready:
-                        break
-            if not telegram_service.is_ready:
-                raise RuntimeError(
-                    "Telegram is not connected — cannot fetch archive volumes"
-                )
-            siblings = await telegram_service.download_archive_volumes(
-                job.telegram_channel_id,
-                job.telegram_message_id,
-                os.path.basename(part1_path),
-                dest_dir,
-                progress_callback=progress,
-            )
-            if siblings:
-                log.with_job(job.id).info(
-                    f"Fetched {len(siblings)} additional volume(s) for {job.filename}"
-                )
 
         return part1_path
 
@@ -478,26 +448,15 @@ class QueueManager:
         """Clean up temporary files after processing."""
         keep = await self._should_keep_downloads()
 
-        # Remove downloaded archive + any sibling volumes (unless keep-downloads is on)
+        # Remove downloaded archive (unless keep-downloads is on)
         if download_path and os.path.exists(download_path):
             if keep:
                 log.info(f"Keeping download (keep-downloads ON): {os.path.basename(download_path)}")
             else:
-                targets = [download_path]
-                # For multi-volume archives, also remove the sibling volumes.
-                matcher = _sibling_matcher(os.path.basename(download_path))
-                if matcher is not None:
-                    folder = os.path.dirname(download_path)
-                    for name in os.listdir(folder):
-                        if matcher.match(name):
-                            sib = os.path.join(folder, name)
-                            if sib not in targets:
-                                targets.append(sib)
-                for target in targets:
-                    try:
-                        os.remove(target)
-                    except OSError as e:
-                        log.warning(f"Failed to remove download {os.path.basename(target)}: {e}")
+                try:
+                    os.remove(download_path)
+                except OSError as e:
+                    log.warning(f"Failed to remove download {os.path.basename(download_path)}: {e}")
 
         # Always remove extracted files (they're just unpacked temp copies)
         if extract_dir and os.path.exists(extract_dir):

@@ -1,7 +1,6 @@
 """Telegram channel monitor — watches for new files and adds them to the queue."""
 
 import asyncio
-import re
 from typing import Optional
 
 from sqlalchemy import select
@@ -19,13 +18,6 @@ log = ComponentLogger("TelegramMonitor")
 
 # Patterns ordered from most specific to least.
 # Each captures the actual password in group 1.
-# Detects multi-part RAR files that aren't the first volume.
-# Only part1 should be queued; unrar will find the other parts automatically.
-_MULTIPART_RAR_SKIP = re.compile(
-    r"\.part(?!0*1\.rar)(\d+)\.rar$",       # .part2.rar, .part3.rar, etc. (skip; keep part1)
-    re.IGNORECASE,
-)
-
 _PASSWORD_PATTERNS = [
     # "Password: xyz", "pass: xyz", "pw: xyz", "pwd: xyz" (with optional colon/equals)
     re.compile(
@@ -143,10 +135,6 @@ class TelegramMonitor:
                     if not any(fname.lower().endswith(ext) for ext in ARCHIVE_EXTS):
                         continue
 
-                    # Skip non-first parts of multi-part RAR archives
-                    if _MULTIPART_RAR_SKIP.search(fname.lower()):
-                        continue
-
                     key = (channel_id, msg["id"])
                     if key in self._processed_messages:
                         continue
@@ -231,11 +219,6 @@ class TelegramMonitor:
         # Only process archive files
         lower = filename.lower()
         if not any(lower.endswith(ext) for ext in (".zip", ".rar", ".7z", ".tar", ".tar.gz", ".tgz")):
-            return
-
-        # Skip non-first parts of multi-part RAR archives
-        if _MULTIPART_RAR_SKIP.search(lower):
-            log.info(f"Skipping multi-part RAR (not part1): {filename}")
             return
 
         # Check DB for duplicates — the in-memory set is empty after restart,
