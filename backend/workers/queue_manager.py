@@ -222,13 +222,20 @@ class QueueManager:
                 files_extracted = await extract_archive(download_path, extract_dir, password=archive_password)
             except RuntimeError as exc:
                 err_lower = str(exc).lower()
-                # If extraction failed due to disk space, scan whatever got extracted
-                if "no space" in err_lower or "disk full" in err_lower or "no space left" in err_lower:
+                # Recoverable extraction errors — scan whatever DID get extracted
+                is_partial_ok = (
+                    "no space" in err_lower
+                    or "disk full" in err_lower
+                    or "no space left" in err_lower
+                    or "previous volume" in err_lower
+                    or "first volume" in err_lower
+                )
+                if is_partial_ok:
                     partial_count = sum(1 for _ in Path(extract_dir).rglob("*") if _.is_file()) if os.path.exists(extract_dir) else 0
                     if partial_count > 0:
                         log_j.warning(
-                            f"Disk full during extraction — scanning {partial_count} "
-                            f"files that were extracted before space ran out"
+                            f"Extraction error ({exc}) — scanning {partial_count} "
+                            f"files that were extracted before the error"
                         )
                         files_extracted = partial_count
                     else:
