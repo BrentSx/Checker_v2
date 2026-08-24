@@ -1,6 +1,7 @@
 """Telegram channel monitor — watches for new files and adds them to the queue."""
 
 import asyncio
+import re
 from typing import Optional
 
 from sqlalchemy import select
