@@ -110,6 +110,50 @@ class TelegramService:
     def is_ready(self) -> bool:
         return self._state == "ready"
 
+    async def ensure_connected(self) -> bool:
+        """Verify the Telethon client is actually connected, reconnect if not.
+
+        The ``_state`` can stay ``"ready"`` even after the underlying TCP
+        connection drops (network blip, server-side idle timeout, etc.).
+        This method checks the real connection state and reconnects
+        transparently, returning True on success.
+        """
+        if not self._client or not self._authenticated:
+            return False
+        try:
+            if self._client.is_connected():
+                return True
+        except Exception:
+            pass
+
+        log.warning("Telegram client disconnected — attempting reconnect...")
+        try:
+            await self._client.connect()
+            if await self._client.is_user_authorized():
+                me = await self._client.get_me()
+                self._user_info = {
+                    "id": me.id,
+                    "first_name": me.first_name or "",
+                    "last_name": me.last_name or "",
+                    "username": me.username or "",
+                    "phone": me.phone or "",
+                }
+                self._state = "ready"
+                self._dialogs_loaded = False
+                await self._ensure_dialogs_loaded()
+                log.info("Telegram reconnected successfully")
+                return True
+            else:
+                self._state = "error"
+                self._error = "Session expired — re-authenticate"
+                log.error(self._error)
+                return False
+        except Exception as e:
+            self._state = "error"
+            self._error = f"Reconnect failed: {e}"
+            log.error(self._error)
+            return False
+
     @property
     def user_info(self) -> Optional[dict]:
         return self._user_info
@@ -292,6 +336,7 @@ class TelegramService:
         if not self._client or not self._authenticated:
             return []
         try:
+            await self.ensure_connected()
             entity = await self._resolve_entity(channel_id)
             messages = []
             async for msg in self._client.iter_messages(entity, limit=limit):
@@ -338,66 +383,106 @@ class TelegramService:
 
         Uses Telethon's download_media which handles DC routing, chunking,
         and retries internally.  tgcrypto speeds up the crypto layer.
+
+        If the client is disconnected, automatically reconnects and retries
+        once before raising.
         """
         if not self._client or not self._authenticated:
             raise RuntimeError("Telegram not connected")
 
-        # Set up cancel event for this download
-        self._cancel_event = asyncio.Event()
+        MAX_RECONNECT_ATTEMPTS = 2
+        dest_path = None
 
-        try:
-            entity = await self._resolve_entity(channel_id)
-            msg = await self._client.get_messages(entity, ids=message_id)
-            if not msg or not msg.document:
-                raise ValueError("Message has no file attachment")
+        for attempt in range(MAX_RECONNECT_ATTEMPTS):
+            # Set up cancel event for this download
+            self._cancel_event = asyncio.Event()
 
-            file_name = "unknown"
-            for attr in msg.document.attributes:
-                if hasattr(attr, "file_name"):
-                    file_name = attr.file_name
-                    break
+            try:
+                # Ensure the connection is actually alive before each attempt
+                if not await self.ensure_connected():
+                    raise RuntimeError("Telegram not connected and reconnect failed")
 
-            os.makedirs(dest_dir, exist_ok=True)
-            dest_path = os.path.join(dest_dir, file_name)
-            file_size = msg.document.size or 0
+                entity = await self._resolve_entity(channel_id)
+                msg = await self._client.get_messages(entity, ids=message_id)
+                if not msg or not msg.document:
+                    raise ValueError("Message has no file attachment")
 
-            log.info(f"Downloading {file_name} ({_format_size(file_size)})")
-            start_time = time.monotonic()
+                file_name = "unknown"
+                for attr in msg.document.attributes:
+                    if hasattr(attr, "file_name"):
+                        file_name = attr.file_name
+                        break
 
-            # Wrap progress to check for cancellation
-            async def checked_progress(current, total):
-                if self._cancel_event and self._cancel_event.is_set():
-                    raise asyncio.CancelledError("Download cancelled by user")
-                if progress_callback:
-                    await progress_callback(current, total)
+                os.makedirs(dest_dir, exist_ok=True)
+                dest_path = os.path.join(dest_dir, file_name)
+                file_size = msg.document.size or 0
 
-            await self._client.download_media(
-                msg,
-                file=dest_path,
-                progress_callback=checked_progress,
-            )
+                log.info(f"Downloading {file_name} ({_format_size(file_size)})")
+                start_time = time.monotonic()
 
-            elapsed = time.monotonic() - start_time
-            speed = file_size / elapsed if elapsed > 0 else 0
-            log.info(f"Download complete: {file_name} — "
-                     f"{_format_size(file_size)} in {elapsed:.1f}s "
-                     f"({_format_size(int(speed))}/s)")
-            return dest_path
+                # Wrap progress to check for cancellation
+                async def checked_progress(current, total):
+                    if self._cancel_event and self._cancel_event.is_set():
+                        raise asyncio.CancelledError("Download cancelled by user")
+                    if progress_callback:
+                        await progress_callback(current, total)
 
-        except asyncio.CancelledError:
-            log.warning(f"Download cancelled")
-            # Clean up partial file
-            if 'dest_path' in locals() and os.path.exists(dest_path):
-                try:
-                    os.remove(dest_path)
-                except OSError:
-                    pass
-            raise
-        except Exception as e:
-            log.error(f"Download failed: {e}")
-            raise
-        finally:
-            self._cancel_event = None
+                await self._client.download_media(
+                    msg,
+                    file=dest_path,
+                    progress_callback=checked_progress,
+                )
+
+                elapsed = time.monotonic() - start_time
+                speed = file_size / elapsed if elapsed > 0 else 0
+                log.info(f"Download complete: {file_name} — "
+                         f"{_format_size(file_size)} in {elapsed:.1f}s "
+                         f"({_format_size(int(speed))}/s)")
+                return dest_path
+
+            except asyncio.CancelledError:
+                log.warning(f"Download cancelled")
+                # Clean up partial file
+                if dest_path and os.path.exists(dest_path):
+                    try:
+                        os.remove(dest_path)
+                    except OSError:
+                        pass
+                raise
+            except (ConnectionError, OSError) as e:
+                # Covers "Cannot send requests while disconnected" and socket errors
+                if attempt < MAX_RECONNECT_ATTEMPTS - 1:
+                    log.warning(
+                        f"Download failed (disconnected): {e} — reconnecting and retrying..."
+                    )
+                    # Clean up partial file before retry
+                    if dest_path and os.path.exists(dest_path):
+                        try:
+                            os.remove(dest_path)
+                        except OSError:
+                            pass
+                    await asyncio.sleep(2)
+                    continue
+                log.error(f"Download failed after reconnect: {e}")
+                raise
+            except Exception as e:
+                err_msg = str(e).lower()
+                # Telethon wraps disconnect in various exception types
+                if "disconnected" in err_msg and attempt < MAX_RECONNECT_ATTEMPTS - 1:
+                    log.warning(
+                        f"Download failed (disconnected): {e} — reconnecting and retrying..."
+                    )
+                    if dest_path and os.path.exists(dest_path):
+                        try:
+                            os.remove(dest_path)
+                        except OSError:
+                            pass
+                    await asyncio.sleep(2)
+                    continue
+                log.error(f"Download failed: {e}")
+                raise
+            finally:
+                self._cancel_event = None
 
     async def download_archive_volumes(
         self,
@@ -419,6 +504,10 @@ class TelegramService:
         """
         if not self._client or not self._authenticated:
             raise RuntimeError("Telegram not connected")
+
+        # Ensure the connection is alive before starting volume downloads
+        if not await self.ensure_connected():
+            raise RuntimeError("Telegram not connected and reconnect failed")
 
         matcher = _sibling_matcher(part1_filename)
         if matcher is None:
