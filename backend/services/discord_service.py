@@ -43,8 +43,14 @@ class DiscordService:
             # Use certifi CA bundle — CentOS 7 custom Python can't find system certs
             ssl_ctx = ssl.create_default_context(cafile=certifi.where())
             connector = aiohttp.TCPConnector(ssl=ssl_ctx)
-            # 30s total timeout prevents hanging on unresponsive Discord API
-            timeout = aiohttp.ClientTimeout(total=30)
+            # Per-request timeout only — the session itself stays open across
+            # multi-part uploads that can take minutes with rate-limit sleeps.
+            # The old `total=30` killed the session mid-upload on large results.
+            timeout = aiohttp.ClientTimeout(
+                total=None,        # no session-wide cap
+                sock_connect=15,   # 15s to establish connection
+                sock_read=30,      # 30s for Discord to respond per request
+            )
             self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
         return self._session
 
